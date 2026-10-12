@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell script syntax
+        run: for f in tests/*.sh; do bash -n "$f"; done
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: ShellCheck
+        run: |
+          shellcheck -S warning tests/*.sh
+
+      - name: PowerShell parse (no syntax errors)
+        run: |
+          pwsh -NoProfile -Command '
+            $t = $null; $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "tools/DeskBridge.ps1").Path, [ref]$t, [ref]$e)
+            if ($e) { $e | ForEach-Object { Write-Host $_ }; exit 1 }
+            Write-Host "DeskBridge.ps1 parse OK"'
+
+      - name: Python syntax
+        run: |
+          python3 -m py_compile src/deskbridge ci/download_manifest.py ci/package_bundles.py \
+            tests/test_server_config.py tests/test_client_config.py tests/test_server_ini.py \
+            tests/test_deskbridge.py
+
+      - name: Server config test (text)
+        run: python3 tests/test_server_config.py
+
+      - name: Server config test (INI)
+        run: python3 tests/test_server_ini.py
+
+      - name: Client config test
+        run: python3 tests/test_client_config.py
+
+      - name: App core tests
+        run: python3 tests/test_deskbridge.py
+
+      - name: Manifest reachable + sizes match
+        run: |
+          python3 - <<'EOF'
+          import json, sys, urllib.request
+          m = json.load(open('ci/manifest.json'))
+          for name, a in m['artifacts'].items():
+              req = urllib.request.Request(a['url'], method='HEAD')
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  clen = int(r.headers.get('Content-Length', 0) or 0)
+                  print(f"{name}: HEAD {r.status} size={clen}")
+                  if clen and clen != a['size']:
+                      sys.exit(f"size mismatch for {name}: manifest {a['size']}, live {clen}")
+          EOF

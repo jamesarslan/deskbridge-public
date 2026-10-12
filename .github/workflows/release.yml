@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download pinned engine artifacts (sha256 + size verified)
+        run: python3 ci/download_manifest.py stage
+
+      - name: Assemble bundles + checksums + release notes
+        run: python3 ci/package_bundles.py stage
+
+      - name: Show bundle tree
+        run: |
+          find stage/release -type f | sort
+          echo
+          cat stage/release/SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            stage/release/*.zip
+            stage/release/SHA256SUMS
+            stage/release/RELEASE.md
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body_path: stage/release/RELEASE.md

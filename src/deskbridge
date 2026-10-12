@@ -1,0 +1,1572 @@
+#!/usr/bin/env python3
+"""DeskBridge - guided keyboard/mouse/clipboard sharing over Deskflow.
+
+Product layer (MIT) over the unmodified Deskflow 1.27.0 engine
+(GPL-2.0-only with LicenseRef-OpenSSL-Exception, https://deskflow.org).
+
+DeskBridge ships no engine code. It guides setup (role, peer discovery,
+screen placement, TLS pairing, firewall scoping), supervises the engine
+(systemd-run --user on Linux), keeps state in deskbridge.json, and offers
+status/diagnose/repair plus a local web UI.
+
+License: MIT (this file and this repo's product code only).
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import gzip
+import hashlib
+import json
+import os
+import pathlib
+import re
+import secrets
+import shutil
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import threading
+import time
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+APP = "DeskBridge"
+VERSION_FALLBACK = "0.2.0"
+ENGINE_MIN = "1.27.0"
+DEFAULT_PORT = 24800
+WEB_DEFAULT_PORT = 8472
+CERT_DAYS = 365
+CERT_KEY_SIZE = 2048
+CERT_SUBJECT = "/CN=Deskflow"
+SIDES = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
+ENGINE_BINARIES = {"gui": "deskflow", "core": "deskflow-core"}
+LEGACY_PROC_NAMES = ("deskflow", "deskflow-core", "deskflow-client", "deskflow-server")
+ENGINE_HOME_REL = pathlib.PurePosixPath("Deskflow")
+APP_HOME_REL = pathlib.PurePosixPath("DeskBridge")
+STATE_REL = pathlib.PurePosixPath(".local/state/deskbridge")
+FINGERPRINT_RE = re.compile(r"^(v2:sha256:)?([0-9a-fA-F]{64})$")
+HEX_RE = re.compile(r"^[0-9a-fA-F]{8,64}$")
+
+
+def app_version() -> str:
+    here = pathlib.Path(__file__).resolve().parent
+    for rel in (pathlib.PurePath("..") / "VERSION", pathlib.PurePath("VERSION")):
+        p = (here / rel).resolve()
+        if p.is_file():
+            text = p.read_text().strip()
+            if not text:
+                continue
+            # VERSION may be JSON ({ "version": "..." }) or a plain line.
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict) and data.get("version"):
+                    return str(data["version"]).strip()
+            except json.JSONDecodeError:
+                pass
+            m = re.search(r"(\d+(?:\.\d+)*[A-Za-z0-9.\-+]*)", text)
+            if m:
+                return m.group(1)
+    return VERSION_FALLBACK
+
+
+class Paths:
+    """All file paths for one profile, isolated per profile."""
+
+    def __init__(self, profile: str, home: pathlib.Path | None = None):
+        self.profile = profile
+        self.home = (home or pathlib.Path(os.path.expanduser("~"))).resolve()
+        self.config_root = self.home / ".config"
+        self.app_home = self.config_root / APP_HOME_REL / profile
+        self.state_file = self.app_home / "deskbridge.json"
+        self.state_dir = self.home / STATE_REL.parent / "deskbridge"
+        self.log_file = self.state_dir / f"{profile}.log"
+        self.unit = f"deskbridge-{profile}"
+        if profile == "default":
+            # Standard engine path: ~/.config/Deskflow (no XDG override).
+            self.xdg: pathlib.Path | None = None
+            self.engine_home = self.config_root / ENGINE_HOME_REL
+        else:
+            # Isolated: the engine (GUI) reads its home from XDG_CONFIG_HOME.
+            self.xdg = self.app_home / "xdg"
+            self.engine_home = self.xdg / ENGINE_HOME_REL
+        self.engine_conf = self.engine_home / "Deskflow.conf"
+        self.tls_dir = self.engine_home / "tls"
+        self.cert = self.tls_dir / "deskflow.pem"
+        self.trust_db = self.tls_dir / "trusted-servers"
+        self.server_map = self.engine_home / "server.config"
+        self.port = DEFAULT_PORT if profile == "default" else (
+            DEFAULT_PORT + 1 + zlib.crc32(profile.encode()) % 100
+        )
+
+
+def die(msg: str, code: int = 1, json_out: dict | None = None):
+    if json_out is not None:
+        print(json.dumps(json_out, indent=2, sort_keys=True))
+    print(f"{APP}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd: list[str], timeout: float = 15.0, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+
+
+def sudo_prefix() -> list[str]:
+    if os.geteuid() == 0:
+        return []
+    if shutil.which("sudo"):
+        return ["sudo"]
+    return []
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def parse_version(text: str):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+def atomic_write(path: pathlib.Path, text: str, mode: int = 0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def default_state(profile: str) -> dict:
+    return {
+        "version": 1,
+        "profile": profile,
+        "role": None,
+        "name": None,
+        "peer": None,
+        "port": None,
+        "engine": "gui",
+        "autostart": False,
+        "firewall_scoped": False,
+        "map": {},
+        "wizard_done": False,
+        "created": None,
+        "updated": None,
+    }
+
+
+def load_state(paths: Paths) -> dict:
+    st = default_state(paths.profile)
+    if paths.state_file.is_file():
+        try:
+            data = json.loads(paths.state_file.read_text())
+            st.update(data)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return st
+
+
+def save_state(paths: Paths, st: dict):
+    st["updated"] = now_iso()
+    atomic_write(paths.state_file, json.dumps(st, indent=2, sort_keys=True) + "\n")
+
+
+# ---------------------------------------------------------------- config
+
+def read_engine_conf(paths: Paths) -> dict:
+    """Parse the engine INI into a flat section-key dict. Tolerant."""
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.optionxform = str
+    try:
+        cp.read_string(paths.engine_conf.read_text())
+    except (OSError, configparser.Error):
+        return {}
+    out: dict = {}
+    for s in cp.sections():
+        for k, v in cp.items(s):
+            out[f"{s}.{k}"] = v
+    return out
+
+
+def conf_bool(v: str) -> bool:
+    return str(v).strip().lower() in ("true", "1", "yes", "on")
+
+
+def validate_conf(paths: Paths, st: dict) -> list[str]:
+    """Structural checks on the engine config we wrote (or adopted)."""
+    errors = []
+    if not paths.engine_conf.is_file():
+        return ["engine config missing"]
+    flat = read_engine_conf(paths)
+    need = ["core.computerName", "core.coreMode", "core.port", "core.preventSleep"]
+    for k in need:
+        if k not in flat:
+            errors.append(f"missing key [{k.split('.')[0]}] {k.split('.')[1]}")
+    if st["role"] == "server":
+        if not conf_bool(flat.get("server.externalConfig", "false")):
+            errors.append("server.externalConfig must be true")
+        if not paths.server_map.is_file():
+            errors.append(f"screen map missing: {paths.server_map}")
+        for k in ("server.enableClipboard", "server.switchDelay"):
+            if k not in flat:
+                errors.append(f"missing key [{k.split('.')[0]}] {k.split('.')[1]}")
+    if st["role"] == "client":
+        if not flat.get("client.remoteHost", ""):
+            errors.append("client.remoteHost empty")
+    _conf_text = paths.engine_conf.read_text()
+    if re.search(r"^\s*externalConfigFile\s*=", _conf_text, re.M) and re.search(r"^\[internalConfig\]", _conf_text, re.M):
+        errors.append("externalConfigFile and internalConfig cannot both be present")
+    sec = flat.get("security.tlsEnabled", "")
+    if sec and not conf_bool(sec):
+        errors.append("security.tlsEnabled must be true (DeskBridge is TLS-only)")
+    return errors
+
+
+def write_engine_conf(paths: Paths, st: dict) -> list[str]:
+    """Write the engine config from state. Returns backup paths created."""
+    backups = []
+    if paths.engine_conf.is_file():
+        bak = paths.engine_conf.with_name(paths.engine_conf.name + f".bak.{int(time.time())}")
+        bak.write_text(paths.engine_conf.read_text())
+        backups.append(str(bak))
+    port = st.get("port") or paths.port
+    name = st["name"]
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.optionxform = str
+    cp.add_section("core")
+    cp["core"] = {
+        "computerName": name,
+        "coreMode": "2" if st["role"] == "server" else "1",
+        "port": str(port),
+        "preventSleep": "false",
+    }
+    cp.add_section("client")
+    cp["client"] = {}
+    if st["role"] == "server":
+        cp.add_section("server")
+        cp["server"] = {
+            "externalConfig": "true",
+            "externalConfigFile": str(paths.server_map),
+            "enableClipboard": "true",
+            "switchDelay": "250",
+        }
+    else:
+        cp["client"]["remoteHost"] = st["peer"] or ""
+    cp.add_section("security")
+    cp["security"] = {
+        "tlsEnabled": "true",
+        "checkPeerFingerprints": "true",
+        "keySize": str(CERT_KEY_SIZE),
+    }
+    cp.add_section("gui")
+    cp["gui"] = {
+        "startCoreWithGui": "true",
+        "closeToTray": "true",
+        "autoHide": "false",
+        "enableUpdateCheck": "false",
+    }
+    cp.add_section("log")
+    cp["log"] = {"file": str(paths.log_file), "level": "Info", "toFile": "true"}
+    buf = []
+    for s in cp.sections():
+        buf.append(f"[{s}]")
+        for k in cp[s]:
+            buf.append(f"{k} = {cp[s][k]}")
+        buf.append("")
+    paths.engine_home.mkdir(parents=True, exist_ok=True)
+    atomic_write(paths.engine_conf, "\n".join(buf), 0o600)
+    return backups
+
+
+def write_server_map(paths: Paths, st: dict) -> None:
+    """Synergy-style screen map text for the server role."""
+    lines = ["section: links"]
+    for computer, neighbors in sorted((st.get("map") or {}).items()):
+        lines.append(f"{computer}:")
+        for side, other in sorted(neighbors.items()):
+            lines.append(f"    {side} = {other}")
+    lines.append("end")
+    lines.append("section: options")
+    lines.append("    clipboardSharing = true")
+    lines.append("end")
+    lines.append("")
+    paths.engine_home.mkdir(parents=True, exist_ok=True)
+    atomic_write(paths.server_map, "\n".join(lines), 0o600)
+
+
+# ---------------------------------------------------------------- engine
+
+def engine_binaries(paths: Paths) -> dict:
+    out = {}
+    for kind, name in ENGINE_BINARIES.items():
+        out[kind] = shutil.which(name)
+    return out
+
+
+def engine_version(probe_binary: str | None) -> str:
+    if not probe_binary:
+        return "unknown"
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    try:
+        r = run([probe_binary, "--version"], timeout=10, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    text = (r.stdout + r.stderr).strip()
+    m = re.search(r"v(\d+\.\d+\.\d+)", text)
+    return m.group(1) if m else (text.splitlines()[0] if text else "unknown")
+
+
+def engine_ok(paths: Paths, st: dict) -> tuple[bool, str]:
+    bins = engine_binaries(paths)
+    kind = st.get("engine") or "gui"
+    if not bins.get(kind):
+        other = "core" if kind == "gui" else "gui"
+        if bins.get(other):
+            return True, f"engine '{kind}' missing; falling back to '{other}'"
+        return False, f"engine binary not found: {ENGINE_BINARIES[kind]}"
+    probe = bins.get("core")
+    ver = engine_version(probe) if probe else "unknown"
+    if ver != "unknown":
+        if parse_version(ver) < parse_version(ENGINE_MIN):
+            return False, f"engine {ver} < required {ENGINE_MIN}"
+    return True, ""
+
+
+# ---------------------------------------------------------------- supervisor
+
+def find_engine_processes() -> list[dict]:
+    procs = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return procs
+    for pid in pids:
+        try:
+            comm = pathlib.Path(f"/proc/{pid}/comm").read_text().strip()
+        except OSError:
+            continue
+        if comm not in LEGACY_PROC_NAMES:
+            continue
+        try:
+            cmdline = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            cmdline = ""
+        try:
+            environ = pathlib.Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            environ = b""
+        procs.append({"pid": int(pid), "name": comm, "cmdline": cmdline, "environ": environ})
+    return procs
+
+
+def profile_processes(paths: Paths) -> list[dict]:
+    out = []
+    for p in find_engine_processes():
+        env, cmd = p["environ"], p["cmdline"].encode()
+        if paths.profile == "default":
+            if b"XDG_CONFIG_HOME=" in env:
+                xdg = env.split(b"XDG_CONFIG_HOME=", 1)[1].split(b"\0", 1)[0]
+                if b"DeskBridge" in xdg:
+                    continue  # belongs to an isolated profile
+            out.append(p)
+        else:
+            if paths.xdg and b"XDG_CONFIG_HOME=" + str(paths.xdg).encode() in env:
+                out.append(p)
+                continue
+            if b"-s " + str(paths.engine_conf).encode() in cmd:
+                out.append(p)
+    return out
+
+
+def unit_active(paths: Paths) -> bool:
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        r = run(["systemctl", "--user", "is-active", "--quiet", paths.unit], timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def unit_main_pid(paths: Paths) -> int | None:
+    try:
+        r = run(["systemctl", "--user", "show", "--value", "-p", "MainPID", paths.unit], timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        pid = int(r.stdout.strip())
+    except ValueError:
+        return None
+    return pid or None
+
+
+def supervisor_env(paths: Paths, st: dict) -> list[str]:
+    """systemd-run arguments that isolate this profile from others."""
+    args = []
+    if paths.xdg:
+        paths.xdg.mkdir(parents=True, exist_ok=True)
+        args.append(f"--setenv=XDG_CONFIG_HOME={paths.xdg}")
+    return args
+
+
+def start_engine(paths: Paths, st: dict) -> dict:
+    kind = st.get("engine") or "gui"
+    binary = shutil.which(ENGINE_BINARIES[kind])
+    fallback = ""
+    if not binary:
+        other = "core" if kind == "gui" else "gui"
+        binary = shutil.which(ENGINE_BINARIES[other])
+        kind, fallback = other, f"engine '{st.get('engine')}' missing; using '{other}'"
+    if not binary:
+        return {"started": False, "error": f"engine binary not found ({ENGINE_BINARIES[kind] or 'deskflow'})"}
+    cmd = [binary]
+    if kind == "core" and paths.xdg:
+        cmd += ["-s", str(paths.engine_conf)]
+    unit_args = [
+        "systemd-run", "--user", "--unit", paths.unit, "--collect",
+        "--property=Restart=on-failure", "--property=RestartSec=3",
+        *supervisor_env(paths, st),
+    ] + cmd
+    try:
+        r = run(unit_args, timeout=15)
+    except OSError as e:
+        return {"started": False, "error": f"systemd-run failed: {e}"}
+    if r.returncode != 0:
+        return {"started": False, "error": (r.stderr or r.stdout).strip() or "systemd-run failed"}
+    time.sleep(1.0)
+    note = [x for x in (fallback,) if x]
+    return {"started": True, "unit": paths.unit, "engine": kind, "note": " ".join(note)}
+
+
+def stop_engine(paths: Paths, timeout: float = 8.0) -> dict:
+    killed = []
+    had_unit = unit_active(paths)
+    if had_unit:
+        try:
+            run(["systemctl", "--user", "stop", paths.unit], timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        procs = profile_processes(paths)
+        if not procs:
+            break
+        for p in procs:
+            try:
+                os.kill(p["pid"], 15)
+                killed.append(p["pid"])
+            except OSError:
+                pass
+        time.sleep(0.5)
+    leftovers = [p["pid"] for p in profile_processes(paths)]
+    for pid in leftovers:
+        try:
+            os.kill(pid, 9)
+            killed.append(pid)
+        except OSError:
+            pass
+    if leftovers:
+        time.sleep(0.5)
+    return {"stopped": True, "unit_was_active": had_unit, "pids_terminated": killed}
+
+
+# ---------------------------------------------------------------- firewall
+
+def rich_rule(peer: str, port: int) -> str:
+    return f'rule family="ipv4" source address="{peer}" port port="{port}" protocol="tcp" accept'
+
+
+def firewall_state() -> str:
+    if not shutil.which("firewall-cmd"):
+        return "absent"
+    r = run(["firewall-cmd", "--state"], timeout=10)
+    return "running" if r.returncode == 0 else "not-running"
+
+
+def firewall_apply(paths: Paths, peer: str, port: int) -> dict:
+    if firewall_state() != "running":
+        return {"applied": False, "reason": "firewalld not running (nothing to scope)"}
+    rule = rich_rule(peer, port)
+    q = run([*sudo_prefix(), "firewall-cmd", f"--query-rich-rule={rule}"], timeout=15)
+    if q.returncode == 0:
+        return {"applied": True, "changed": False, "rule": rule}
+    rt = run([*sudo_prefix(), "firewall-cmd", f"--add-rich-rule={rule}"], timeout=15)
+    if rt.returncode != 0:
+        return {"applied": False, "reason": (rt.stderr or rt.stdout).strip()}
+    pm = run([*sudo_prefix(), "firewall-cmd", "--permanent", f"--add-rich-rule={rule}"], timeout=15)
+    if pm.returncode != 0:
+        return {"applied": False, "reason": "runtime rule added but permanent failed: " + (pm.stderr or pm.stdout).strip()}
+    return {"applied": True, "changed": True, "rule": rule}
+
+
+def firewall_remove(paths: Paths, peer: str, port: int) -> dict:
+    if firewall_state() != "running":
+        return {"removed": False, "reason": "firewalld not running"}
+    rule = rich_rule(peer, port)
+    out = {"removed": False, "changed": False}
+    for args in (["--remove-rich-rule"], ["--permanent", "--remove-rich-rule"]):
+        r = run([*sudo_prefix(), "firewall-cmd", *args, rule], timeout=15)
+        if r.returncode == 0:
+            out["changed"] = True
+        elif (r.stderr or r.stdout).find("was not found") < 0:
+            out["reason"] = (r.stderr or r.stdout).strip()
+    out["removed"] = True
+    return out
+
+
+# ---------------------------------------------------------------- tls
+
+def ensure_cert(paths: Paths) -> dict:
+    if paths.cert.is_file():
+        return {"created": False, "path": str(paths.cert)}
+    if not shutil.which("openssl"):
+        return {"created": False, "error": "openssl not found"}
+    paths.tls_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(paths.tls_dir, 0o700)
+    key = paths.cert.with_name("deskflow.key.tmp")
+    crt = paths.cert.with_name("deskflow.crt.tmp")
+    try:
+        r = run([
+            "openssl", "req", "-x509", "-newkey", f"rsa:{CERT_KEY_SIZE}", "-nodes",
+            "-keyout", str(key), "-out", str(crt), "-days", str(CERT_DAYS),
+            "-subj", CERT_SUBJECT,
+        ], timeout=60)
+        if r.returncode != 0:
+            return {"created": False, "error": (r.stderr or r.stdout).strip()}
+        pem = key.read_bytes() + crt.read_bytes()
+        atomic_write(paths.cert, pem.decode(), 0o600)
+        return {"created": True, "path": str(paths.cert)}
+    finally:
+        for p in (key, crt):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def cert_fingerprint(paths: Paths) -> str | None:
+    if not paths.cert.is_file():
+        return None
+    r = run(["openssl", "x509", "-in", str(paths.cert), "-noout", "-fingerprint", "-sha256"], timeout=10)
+    if r.returncode != 0:
+        return None
+    m = re.search(r"=([0-9A-F:]+)", r.stdout)
+    return m.group(1).lower().replace(":", "") if m else None
+
+
+def fingerprint_canon(fp: str) -> str:
+    m = FINGERPRINT_RE.match(fp.strip())
+    if not m:
+        raise ValueError(f"invalid fingerprint (want v2:sha256:<64 hex>): {fp!r}")
+    return f"v2:sha256:{m.group(2).lower()}"
+
+
+def trust_lines(paths: Paths) -> list[str]:
+    if not paths.trust_db.is_file():
+        return []
+    return [ln.strip() for ln in paths.trust_db.read_text().splitlines() if ln.strip()]
+
+
+def trust_add(paths: Paths, fp: str) -> dict:
+    canon = fingerprint_canon(fp)
+    lines = trust_lines(paths)
+    if canon in lines:
+        return {"added": False, "fingerprint": canon}
+    lines.append(canon)
+    atomic_write(paths.trust_db, "\n".join(lines) + "\n", 0o600)
+    return {"added": True, "fingerprint": canon}
+
+
+def trust_remove(paths: Paths, fp: str) -> dict:
+    canon = fingerprint_canon(fp)
+    lines = trust_lines(paths)
+    if canon not in lines:
+        return {"removed": False, "fingerprint": canon}
+    lines.remove(canon)
+    atomic_write(paths.trust_db, "\n".join(lines) + "\n", 0o600)
+    return {"removed": True, "fingerprint": canon}
+
+
+# ---------------------------------------------------------------- discovery
+
+def tcp_open(ip: str, port: int, timeout: float = 0.35) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def local_networks() -> list[tuple[str, str]]:
+    nets = []
+    try:
+        r = run(["ip", "-4", "-o", "-f", "inet", "addr", "show"], timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return nets
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 5:
+            iface, prefix, addr = parts[1], parts[3], parts[4]
+            if iface == "lo":
+                continue
+            nets.append((addr, prefix))
+    return nets
+
+
+def discover(cidr: str | None, port: int, timeout: float = 0.35, workers: int = 64) -> list[dict]:
+    """Passive scan: which addresses have the engine port open. No protocol
+    traffic is sent, so no pairing prompts are triggered on the peers."""
+    import ipaddress
+    hosts: list[str] = []
+    if cidr:
+        for ip in ipaddress.ip_network(cidr, strict=False):
+            hosts.append(str(ip))
+    else:
+        seen = set()
+        for addr, prefix in local_networks():
+            try:
+                net = ipaddress.ip_interface(f"{addr}/{prefix}").network
+            except ValueError:
+                continue
+            for ip in net.hosts():
+                s = str(ip)
+                if s not in seen:
+                    seen.add(s)
+                    hosts.append(s)
+    found = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = pool.map(lambda h: (h, tcp_open(h, port, timeout)), hosts)
+        for h, ok in results:
+            if ok:
+                found.append({"ip": h, "port": port, "tcp": "open"})
+    return found
+
+
+def deep_probe(ip: str, port: int, cert_path: pathlib.Path, timeout: float = 6.0) -> dict:
+    """Full TLS handshake against a candidate engine server using our own
+    certificate. Yields the peer certificate fingerprint without the engine
+    ever running, so it is safe to use before first connection."""
+    if not cert_path.is_file():
+        return {"ok": False, "error": f"local certificate missing: {cert_path}"}
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(str(cert_path))
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname="deskflow") as tls:
+                peer = tls.getpeercert(binary_form=True)
+                if not peer:
+                    return {"ok": False, "error": "peer presented no certificate"}
+                cert = ssl.X509Cert()
+                cert.load_der_x509_cert(peer)
+                der = cert.public_bytes(serialization_format=ssl.Encoding.DER)
+                return {
+                    "ok": True,
+                    "ip": ip,
+                    "port": port,
+                    "fingerprint": f"v2:sha256:{hashlib.sha256(der).hexdigest()}",
+                    "subject": dict(x[0] for x in cert.subject),
+                }
+    except ssl.SSLError as e:
+        return {"ok": False, "error": f"tls handshake failed: {e}"}
+    except OSError as e:
+        return {"ok": False, "error": f"connection failed: {e}"}
+
+
+# ---------------------------------------------------------------- layout
+
+def local_layouts() -> list[str]:
+    layouts = []
+    if shutil.which("gsettings"):
+        r = run(["gsettings", "get", "org.gnome.desktop.input-sources", "sources"], timeout=10)
+        if r.returncode == 0:
+            for m in re.finditer(r"\('(xkb)',\s*'([a-z0-9+-]+)'\)", r.stdout):
+                layouts.append(m.group(2))
+    if not layouts and shutil.which("localectl"):
+        r = run(["localectl", "status"], timeout=10)
+        if r.returncode == 0:
+            m = re.search(r"Layout:\s*([a-z0-9+-]+)", r.stdout)
+            if m:
+                layouts.append(m.group(1))
+    return sorted(set(layouts))
+
+
+# ---------------------------------------------------------------- log
+
+def log_tail(paths: Paths, n: int = 6) -> list[str]:
+    if not paths.log_file.is_file():
+        return []
+    try:
+        lines = paths.log_file.read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines[-n:]:
+        if "PRIVATE KEY" in ln or "BEGIN" in ln and "CERT" in ln:
+            continue
+        ln = re.sub(r"[0-9a-f]{40,}", lambda m: m.group(0)[:8] + "\u2026(redacted)", ln)
+        out.append(ln)
+    return out
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_version(args) -> int:
+    st = load_state(Paths(args.profile))
+    bins = engine_binaries(Paths(args.profile))
+    out = {
+        "deskbridge": app_version(),
+        "engine": {
+            "deskflow": bins.get("gui"),
+            "deskflow-core": bins.get("core"),
+            "version": engine_version(bins.get("core")),
+            "required_minimum": ENGINE_MIN,
+        },
+    }
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print(f"DeskBridge {out['deskbridge']}")
+        print(f"  deskflow (gui) : {out['engine']['deskflow'] or 'not found'}")
+        print(f"  deskflow-core  : {out['engine']['deskflow-core'] or 'not found'}")
+        print(f"  engine version : {out['engine']['version']} (minimum {ENGINE_MIN})")
+    return 0
+
+
+def collect_status(paths: Paths, st: dict) -> dict:
+    port = st.get("port") or paths.port
+    procs = profile_processes(paths)
+    tcp = []
+    if shutil.which("ss"):
+        r = run(["ss", "-tn", "state", "established", "state", "syn-sent", "state", "syn-recv"], timeout=10)
+        for line in r.stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 5 and (parts[4].endswith(f":{port}") or parts[3].endswith(f":{port}")):
+                tcp.append({"local": parts[4], "peer": parts[5] if len(parts) > 5 else parts[3], "state": parts[1]})
+    bins = engine_binaries(paths)
+    ok, note = engine_ok(paths, st)
+    return {
+        "profile": paths.profile,
+        "role": st.get("role"),
+        "name": st.get("name"),
+        "peer": st.get("peer"),
+        "port": port,
+        "engine_kind": st.get("engine") or "gui",
+        "engine_installed": bool(bins.get(st.get("engine") or "gui") or bins.get("core")),
+        "engine_version": engine_version(bins.get("core")),
+        "engine_ok": ok,
+        "engine_note": note,
+        "config_present": paths.engine_conf.is_file(),
+        "config_errors": validate_conf(paths, st) if paths.engine_conf.is_file() else ["engine config missing"],
+        "processes": [{"pid": p["pid"], "name": p["name"], "cmdline": p["cmdline"]} for p in procs],
+        "unit": {"name": paths.unit, "active": unit_active(paths), "main_pid": unit_main_pid(paths)},
+        "tcp": tcp,
+        "tls": {
+            "cert": str(paths.cert) if paths.cert.is_file() else None,
+            "fingerprint": cert_fingerprint(paths),
+            "trusted_peers": trust_lines(paths),
+        },
+        "firewall": {"state": firewall_state(), "scoped": bool(st.get("firewall_scoped"))},
+        "autostart": bool(st.get("autostart")),
+        "log_tail": log_tail(paths),
+    }
+
+
+def adopt_state(paths: Paths, st: dict) -> dict:
+    """Fill role/name/peer from an existing engine config when no state exists."""
+    if st.get("role") or not paths.engine_conf.is_file():
+        return st
+    flat = read_engine_conf(paths)
+    mode = flat.get("core.coreMode", "")
+    if mode not in ("1", "2"):
+        return st
+    return dict(st, role="client" if mode == "1" else "server",
+                name=st.get("name") or flat.get("core.computerName", ""),
+                peer=st.get("peer") or flat.get("client.remoteHost", ""))
+
+
+def cmd_status(args) -> int:
+    paths = Paths(args.profile)
+    st = adopt_state(paths, load_state(paths))
+    out = collect_status(paths, st)
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+    print(f"DeskBridge profile '{paths.profile}'  (app {app_version()})")
+    role = st.get("role") or "?"
+    print(f"  role/name : {role} / {st.get('name') or '?'}")
+    print(f"  peer/port : {st.get('peer') or '-'} : {out['port']}")
+    eng = "ok" if out["engine_ok"] else f"NOT OK ({out['engine_note']})"
+    print(f"  engine    : v{out['engine_version']} [{eng}]")
+    errs = out["config_errors"]
+    print(f"  config    : {'valid' if not errs else 'INVALID: ' + '; '.join(errs)}")
+    if out["processes"]:
+        ps = ", ".join(f"{p['name']}(pid {p['pid']})" for p in out["processes"])
+        print(f"  processes : {ps}")
+    else:
+        print("  processes : none (engine not running)")
+    u = out["unit"]
+    print(f"  unit      : {u['name']} {'active' if u['active'] else 'inactive'}")
+    if out["tcp"]:
+        for t in out["tcp"]:
+            print(f"  tcp       : {t['local']} <-> {t['peer']} [{t['state']}]")
+    else:
+        print(f"  tcp       : no connections on port {out['port']}")
+    fp = out["tls"]["fingerprint"]
+    print(f"  tls       : cert {'present' if out['tls']['cert'] else 'MISSING'}"
+          + (f" fp={fp[:16]}\u2026" if fp else ""))
+    tp = out["tls"]["trusted_peers"]
+    print(f"  trusted   : {len(tp)} peer fingerprint(s)")
+    print(f"  firewall  : {out['firewall']['state']}" + (" (scoped to peer)" if out["firewall"]["scoped"] else ""))
+    if out["log_tail"]:
+        print("  log (last lines):")
+        for ln in out["log_tail"]:
+            print(f"    {ln}")
+    return 0
+
+
+def require_configured(paths: Paths, st: dict) -> None:
+    if not st.get("role") or not st.get("name") or not paths.engine_conf.is_file():
+        die("not configured yet - run: deskbridge setup", 2)
+
+
+def cmd_start(args) -> int:
+    paths = Paths(args.profile)
+    st = load_state(paths)
+    require_configured(paths, st)
+    ok, note = engine_ok(paths, st)
+    if not ok:
+        die(note, 3)
+    if profile_processes(paths):
+        die("engine for this profile is already running", 4)
+    res = start_engine(paths, st)
+    if not res.get("started"):
+        die(res.get("error", "start failed"), 5)
+    print(f"started {paths.unit} ({res['engine']})", file=sys.stderr)
+    if res.get("note"):
+        print(res["note"], file=sys.stderr)
+    if args.json:
+        print(json.dumps(collect_status(paths, st), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_stop(args) -> int:
+    paths = Paths(args.profile)
+    st = load_state(paths)
+    res = stop_engine(paths)
+    if args.json:
+        print(json.dumps(res, indent=2, sort_keys=True))
+    else:
+        if res["unit_was_active"]:
+            print(f"stopped {paths.unit}")
+        if res["pids_terminated"]:
+            print("terminated pid(s): " + ", ".join(map(str, res["pids_terminated"])))
+        if not res["unit_was_active"] and not res["pids_terminated"]:
+            print("engine not running")
+    return 0
+
+
+def cmd_restart(args) -> int:
+    paths = Paths(args.profile)
+    stop_engine(paths)
+    return cmd_start(args)
+
+
+def cmd_fingerprint(args) -> int:
+    paths = Paths(args.profile)
+    fp = cert_fingerprint(paths)
+    if not fp:
+        die("no local certificate yet - run: deskbridge setup (or deskbridge repair)", 2)
+    if args.json:
+        print(json.dumps({"fingerprint": f"v2:sha256:{fp}"}, indent=2, sort_keys=True))
+    else:
+        print(f"local TLS fingerprint: v2:sha256:{fp}")
+        print("Show this to the operator at the OTHER machine; they compare it with")
+        print("what DeskBridge displays during pairing (trust check).")
+    return 0
+
+
+def cmd_trust(args) -> int:
+    paths = Paths(args.profile)
+    if args.trust_cmd == "list":
+        lines = trust_lines(paths)
+        if args.json:
+            print(json.dumps({"trusted": lines}, indent=2, sort_keys=True))
+        else:
+            if not lines:
+                print("(no trusted peers yet)")
+            for ln in lines:
+                print(ln)
+        return 0
+    try:
+        if args.trust_cmd == "add":
+            res = trust_add(paths, args.fingerprint)
+            if not args.json:
+                print("trusted" if res["added"] else "already trusted")
+        elif args.trust_cmd == "remove":
+            res = trust_remove(paths, args.fingerprint)
+            if not args.json:
+                print("removed" if res["removed"] else "not present")
+    except ValueError as e:
+        die(str(e), 2)
+    if args.json:
+        print(json.dumps(res, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_discover(args) -> int:
+    paths = Paths(args.profile)
+    st = load_state(paths)
+    port = args.port or st.get("port") or paths.port
+    if args.deep:
+        if not args.peer:
+            die("--deep requires --peer <ip>", 2)
+        res = deep_probe(args.peer, port, paths.cert)
+        if args.json:
+            print(json.dumps(res, indent=2, sort_keys=True))
+        elif res.get("ok"):
+            print(f"engine found at {res['ip']}:{res['port']}")
+            print(f"server fingerprint: {res['fingerprint']}")
+            print(f"subject: {res['subject'].get('commonName', '?')}")
+            print(f"add to trust store: deskbridge --profile {paths.profile} trust add {res['fingerprint']}")
+        else:
+            die(res.get("error", "deep probe failed"), 3)
+        return 0
+    found = discover(args.cidr, port)
+    if args.json:
+        print(json.dumps({"port": port, "found": found}, indent=2, sort_keys=True))
+    else:
+        if not found:
+            print(f"no engine listening on port {port} in scanned networks")
+        for f in found:
+            mark = "  <- current peer" if f["ip"] == st.get("peer") else ""
+            print(f"{f['ip']}:{f['port']} tcp open{mark}")
+        print("(passive scan: no protocol traffic sent)")
+    return 0
+
+
+def cmd_layout(args) -> int:
+    layouts = local_layouts()
+    if args.json:
+        print(json.dumps({"layouts": layouts}, indent=2, sort_keys=True))
+    else:
+        if layouts:
+            print("local input layouts: " + ", ".join(layouts))
+        else:
+            print("no input layouts detected (gsettings/localectl)")
+        print("Install the same layouts on the keyboard/mouse machine so remote")
+        print("typing maps to the right keys.")
+    return 0
+
+
+# ---------------------------------------------------------------- autostart
+
+def autostart_enabled(paths: Paths) -> bool:
+    try:
+        r = run(["systemctl", "--user", "is-enabled", "--quiet", paths.unit], timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def autostart_set(paths: Paths, enable: bool, st: dict) -> dict:
+    if enable and not autostart_enabled(paths):
+        r = run(["systemctl", "--user", "enable", paths.unit], timeout=15)
+        if r.returncode != 0:
+            return {"enabled": False, "error": (r.stderr or r.stdout).strip()}
+    elif not enable and autostart_enabled(paths):
+        r = run(["systemctl", "--user", "disable", paths.unit], timeout=15)
+        if r.returncode != 0:
+            return {"enabled": True, "error": (r.stderr or r.stdout).strip()}
+    return {"enabled": autostart_enabled(paths)}
+
+
+# ---------------------------------------------------------------- wizard
+
+def ask(prompt: str, default: str | None, args) -> str:
+    if getattr(args, "yes", False) and default is not None:
+        return default
+    suffix = f" [{default}]" if default else ""
+    try:
+        val = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        val = ""
+    return val or (default or "")
+
+
+def cmd_setup(args) -> int:
+    paths = Paths(args.profile)
+    st = load_state(paths)
+    adopted = st.get("wizard_done") or paths.engine_conf.is_file()
+    results: dict = {}
+
+    # 1. role
+    if args.role:
+        st["role"] = args.role
+    elif st.get("role") and not args.yes:
+        st["role"] = ask(f"role (server = machine with keyboard+mouse)", st["role"], args) or st["role"]
+    else:
+        st["role"] = args.role or (st.get("role") if args.yes else ask("role (server = machine with keyboard+mouse)", "client", args))
+    if st["role"] not in ("server", "client"):
+        die("role must be 'server' or 'client'", 2)
+
+    # 2. peer
+    peer_default = args.peer or st.get("peer")
+    if st["role"] == "client":
+        if not peer_default:
+            found = discover(None, paths.port)
+            cands = [f["ip"] for f in found]
+            if cands and not args.yes:
+                print("engines found on this LAN: " + ", ".join(cands))
+            peer_default = cands[0] if cands else None
+        st["peer"] = ask("server address (IP of the machine with keyboard+mouse)", peer_default, args)
+        if not st["peer"]:
+            die("client needs a server address", 2)
+    else:
+        st["peer"] = args.peer or st.get("peer")  # informational only
+
+    # 3. name
+    name_default = args.name or st.get("name") or (
+        "fedora" if st["role"] == "client" else "windows")
+    st["name"] = ask("computer name (must be unique across both machines)", name_default, args)
+    if not st["name"]:
+        die("a computer name is required", 2)
+
+    # 4. port
+    st["port"] = int(args.port or st.get("port") or paths.port)
+
+    # 5. screen placement (server only)
+    if st["role"] == "server":
+        if args.side:
+            side = args.side
+        else:
+            side = ask("which side is the client monitor on? (left/right/top/bottom)",
+                        (st.get("map") or {}).get(st["name"], {}).get("left", "left"), args)
+        if side not in SIDES:
+            die("side must be left, right, top or bottom", 2)
+        client_name = ask("name for the client machine (must match its computer name)",
+                           st.get("client_name") or "fedora", args)
+        st["client_name"] = client_name
+        st["map"] = {st["name"]: {side: client_name}, client_name: {SIDES[side]: st["name"]}}
+
+    # 6. engine choice
+    st["engine"] = args.engine or st.get("engine") or "gui"
+
+    # 7. local certificate
+    res = ensure_cert(paths)
+    results["cert"] = res
+    fp = cert_fingerprint(paths)
+
+    # 8. pairing (client): fetch server fingerprint if reachable
+    if st["role"] == "client":
+        probe = deep_probe(st["peer"], st["port"], paths.cert) if not args.yes or args.peer else {"ok": False}
+        if probe.get("ok"):
+            if args.yes or ask(f"trust server fingerprint {probe['fingerprint'][:24]}\u2026 now?", "yes", args) in ("y", "yes"):
+                results["trust"] = trust_add(paths, probe["fingerprint"])
+            else:
+                results["trust"] = {"added": False, "note": "skipped; engine will show a confirm dialog on first connect"}
+        else:
+            results["trust"] = {"added": False, "note": probe.get("error") or "server not reachable yet; pairing dialog will appear on first connect"}
+
+    # 9. write configs
+    backups = write_engine_conf(paths, st)
+    if st["role"] == "server":
+        write_server_map(paths, st)
+    results["backups"] = backups
+
+    # 10. firewall (server role, Linux)
+    if st["role"] == "server":
+        if st.get("peer"):
+            res = firewall_apply(paths, st["peer"], st["port"])
+            results["firewall"] = res
+            st["firewall_scoped"] = res.get("applied", False)
+        else:
+            results["firewall"] = {"applied": False, "reason": "no peer address given"}
+            st["firewall_scoped"] = False
+    else:
+        results["firewall"] = {"applied": False, "reason": "client role: no inbound rule needed"}
+
+    # 11. autostart
+    if args.autostart is not None:
+        want = args.autostart
+    else:
+        want = ask("start at login?", "yes" if adopted else "no", args) in ("y", "yes", "true")
+    if want:
+        results["autostart"] = autostart_set(paths, True, st)
+    else:
+        results["autostart"] = autostart_set(paths, False, st)
+    st["autostart"] = autostart_enabled(paths)
+
+    st["wizard_done"] = True
+    if not st.get("created"):
+        st["created"] = now_iso()
+    save_state(paths, st)
+    results["state"] = str(paths.state_file)
+    results["config"] = str(paths.engine_conf)
+    results["map"] = str(paths.server_map) if st["role"] == "server" else None
+    results["fingerprint"] = f"v2:sha256:{fp}" if fp else None
+
+    # 12. validation + optional start
+    errs = validate_conf(paths, st)
+    results["config_errors"] = errs
+    if args.start_now:
+        args2 = argparse.Namespace(profile=args.profile, json=args.json)
+        results["start"] = "see deskbridge start" if errs else "run: deskbridge start"
+        if not errs:
+            res = start_engine(paths, st)
+            results["start"] = res
+    if args.json:
+        print(json.dumps(results, indent=2, sort_keys=True))
+    else:
+        print(f"setup complete for profile '{paths.profile}'")
+        print(f"  role/name  : {st['role']} / {st['name']}")
+        if st["peer"]:
+            print(f"  peer       : {st['peer']}:{st['port']}")
+        if st["role"] == "server":
+            edge = next(iter((st.get("map") or {}).get(st["name"], {})), "?")
+            print(f"  screen map : client is on the {edge} edge")
+            fw = results.get("firewall", {})
+            print(f"  firewall   : {'scoped to peer' if fw.get('applied') else fw.get('reason', 'n/a')}")
+        print(f"  certificate: {'created' if results['cert'].get('created') else 'kept existing'} {results['cert'].get('path', '')}")
+        if fp:
+            print(f"  fingerprint: v2:sha256:{fp}")
+            print("  -> at the other machine: deskbridge fingerprint (compare these values)")
+        tr = results.get("trust", {})
+        if tr.get("added"):
+            print(f"  trust      : server fingerprint stored ({tr['fingerprint'][:24]}\u2026)")
+        elif tr.get("note") and not adopted:
+            print(f"  trust      : {tr['note']}")
+        print(f"  autostart  : {'enabled' if st['autostart'] else 'off'}")
+        if errs:
+            print("  config     : INVALID -> " + "; ".join(errs), file=sys.stderr)
+        if st["role"] == "client":
+            lay = local_layouts()
+            if lay:
+                print(f"  layouts    : local = {', '.join(lay)} (install the same on the server machine)")
+        print("next: deskbridge start   (then move the cursor to the shared edge)")
+    return 0 if not errs else 6
+
+
+
+
+# ---------------------------------------------------------------- repair
+
+def cmd_repair(args) -> int:
+    paths = Paths(args.profile)
+    st = load_state(paths)
+    if not st.get("role") or not st.get("name"):
+        die("no state to repair from - run: deskbridge setup", 2)
+    out: dict = {"profile": paths.profile}
+    errs = validate_conf(paths, st)
+    if errs or not paths.engine_conf.is_file():
+        out["config"] = {"rewritten": True, "backups": write_engine_conf(paths, st)}
+        if st["role"] == "server":
+            write_server_map(paths, st)
+    else:
+        out["config"] = {"rewritten": False}
+    res = ensure_cert(paths)
+    out["cert"] = res
+    if st["role"] == "server" and st.get("peer"):
+        out["firewall"] = firewall_apply(paths, st["peer"], st["port"] or paths.port)
+    save_state(paths, st)
+    out["config_errors"] = validate_conf(paths, st)
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print(f"repair: config {'rewritten' if out['config']['rewritten'] else 'ok'}"
+              f", cert {'created' if res.get('created') else 'ok'}")
+        if out["firewall"]:
+            print(f"repair: firewall {out['firewall'].get('applied') or out['firewall'].get('reason')}")
+        if out["config_errors"]:
+            print("still invalid: " + "; ".join(out["config_errors"]), file=sys.stderr)
+    return 0 if not out["config_errors"] else 6
+
+
+# ---------------------------------------------------------------- uninstall
+
+LEGACY_DESKTOP_NAMES = ("deskbridge-start.desktop", "deskbridge-stop.desktop")
+
+
+def cmd_uninstall(args) -> int:
+    paths = Paths(args.profile)
+    out: dict = {"profile": paths.profile}
+    out["stop"] = stop_engine(paths)
+    if autostart_enabled(paths):
+        run(["systemctl", "--user", "disable", paths.unit], timeout=15)
+    for legacy in LEGACY_DESKTOP_NAMES:
+        for d in (paths.home / ".config/autostart", paths.home / ".local/share/applications"):
+            p = d / legacy
+            if p.is_file():
+                p.unlink()
+                out.setdefault("legacy_removed", []).append(str(p))
+    if paths.engine_conf.is_file():
+        bak = paths.engine_conf.with_name(paths.engine_conf.name + f".uninstalled.{int(time.time())}")
+        paths.engine_conf.replace(bak)
+        out["config_backup"] = str(bak)
+    if paths.server_map.is_file():
+        paths.server_map.unlink()
+        out["map_removed"] = True
+    st = load_state(paths)
+    if st.get("role") == "server" and st.get("peer"):
+        out["firewall"] = firewall_remove(paths, st["peer"], st.get("port") or paths.port)
+    removed = []
+    for p in (paths.state_file, paths.server_map, paths.log_file):
+        if p.is_file():
+            p.unlink()
+            removed.append(str(p))
+    # Non-default profiles own their whole tree: sweep it, keeping TLS and
+    # the .uninstalled config backup. Default profile shares ~/.config/Deskflow
+    # with the engine, so only known product files go.
+    if paths.xdg is not None:
+        for root, dirs, files in os.walk(paths.app_home, topdown=False):
+            rp = pathlib.Path(root)
+            for f in files:
+                fp = rp / f
+                if fp.is_relative_to(paths.tls_dir) or fp.name.startswith(paths.engine_conf.name + ".uninstalled"):
+                    continue
+                try:
+                    fp.unlink()
+                    removed.append(str(fp))
+                except OSError:
+                    pass
+            try:
+                if not any(rp.iterdir()):
+                    rp.rmdir()
+            except OSError:
+                pass
+    out["removed"] = removed
+    out["state_removed"] = True
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print("uninstalled profile " + paths.profile)
+        if out.get("config_backup"):
+            print(f"  engine config backed up to: {out['config_backup']}")
+        if out.get("legacy_removed"):
+            for p in out["legacy_removed"]:
+                print(f"  removed legacy: {p}")
+        print("  engine itself left in place (rm: sudo dnf remove deskflow)  " )
+        print("  TLS certs and trust db remain under the engine home; delete manually if wanted")
+    return 0
+
+
+# ---------------------------------------------------------------- diagnose
+
+def display_protocol() -> str:
+    x = os.environ.get("XDG_SESSION_TYPE", "")
+    if x:
+        return x
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "none"
+
+
+def _diagnose_checks(paths: Paths, st: dict) -> list[dict]:
+    """Check list shared by cmd_diagnose and the web status endpoint."""
+    port = st.get("port") or paths.port
+    checks: list[dict] = []
+
+    def add(ok: bool, warn: bool, what: str, detail: str = "", fix: str = ""):
+        checks.append({"status": "pass" if ok else ("warn" if warn else "fail"),
+                       "what": what, "detail": detail, "fix": fix})
+
+    ok, note = engine_ok(paths, st)
+    add(ok, not ok, f"engine installed (>= {ENGINE_MIN})", note or "ok", "dnf install deskflow")
+    if not st.get("role"):
+        add(False, True, "configured", "no state found", "deskbridge setup")
+        return checks
+    errs = validate_conf(paths, st) if paths.engine_conf.is_file() else ["engine config missing"]
+    add(not errs, False, "engine config valid", "; ".join(errs), "deskbridge repair")
+    fp = cert_fingerprint(paths)
+    add(bool(fp), False, "local TLS certificate", fp or "missing", "deskbridge repair")
+    procs = profile_processes(paths)
+    add(bool(procs), not procs, "engine running",
+        ", ".join(p["name"] for p in procs), "deskbridge start")
+    if st["role"] == "client" and st.get("peer"):
+        open_ = tcp_open(st["peer"], port, 2.0)
+        add(open_, False, f"server reachable at {st['peer']}:{port}",
+            "tcp open" if open_ else "tcp closed/filtered", "deskbridge start on the server machine")
+    return checks
+
+
+def cmd_diagnose(args) -> int:
+    paths = Paths(args.profile)
+    st = adopt_state(paths, load_state(paths))
+    port = st.get("port") or paths.port
+    checks: list[dict] = list(_diagnose_checks(paths, st))
+
+    if st.get("role"):
+        if st["role"] == "client":
+            peer = st.get("peer") or ""
+            tls = trust_lines(paths)
+            checks.append({"status": "pass" if tls else "warn", "what": "server fingerprint trusted",
+                           "detail": f"{len(tls)} entry/entries",
+                           "fix": f"deskbridge discover --deep {peer}  (then: trust add <fp>)" if not tls else ""})
+            lay = local_layouts()
+            checks.append({"status": "pass" if lay else "warn", "what": "input layouts detected",
+                           "detail": ", ".join(lay),
+                           "fix": "install matching layouts on the server machine" if not lay else ""})
+        else:
+            checks.append({"status": "pass" if paths.server_map.is_file() else "fail",
+                           "what": "screen map present", "detail": str(paths.server_map),
+                           "fix": "" if paths.server_map.is_file() else "deskbridge repair"})
+            if st.get("peer"):
+                fw = firewall_state()
+                scoped = False
+                if fw == "running":
+                    r = run([*sudo_prefix(), "firewall-cmd",
+                             f"--query-rich-rule={rich_rule(st['peer'], port)}"], timeout=15)
+                    scoped = r.returncode == 0
+                checks.append({"status": "pass" if (fw != "running" or scoped) else "fail",
+                               "what": "firewall scoped to peer",
+                               "detail": "scoped" if scoped else ("firewalld not running" if fw != "running" else "open to all"),
+                               "fix": "" if (fw != "running" or scoped) else "deskbridge repair"})
+        procs = profile_processes(paths)
+        if procs and st["role"] == "client":
+            r = run(["ss", "-tn", "state", "established"], timeout=10)
+            est = any(f":{port}" in ln for ln in r.stdout.splitlines())
+            checks.append({"status": "pass" if est else "warn", "what": "tcp connection established",
+                           "detail": "", "fix": "wait a moment, then check the log"})
+        checks.append({"status": "pass", "what": "display session", "detail": display_protocol(),
+                       "fix": "run inside the desktop session" if display_protocol() == "none" else ""})
+        tail = log_tail(paths, 3)
+        checks.append({"status": "pass", "what": "recent log",
+                       "detail": " | ".join(t[-70:] for t in tail) if tail else "(no log yet)", "fix": ""})
+
+    if args.json:
+        print(json.dumps({"profile": paths.profile, "checks": checks}, indent=2, sort_keys=True))
+        return 0
+    for c in checks:
+        mark = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}[c["status"]]
+        line = f"  {mark}  {c['what']}"
+        if c["detail"]:
+            line += f"  ({c['detail']})"
+        print(line)
+        if c["fix"] and c["status"] != "pass":
+            print(f"        fix: {c['fix']}")
+    fails = [c for c in checks if c["status"] == "fail"]
+    return 1 if fails else 0
+
+
+# ---------------------------------------------------------------- web
+
+WEB_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>DeskBridge</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font:14px/1.45 system-ui,sans-serif;margin:2rem auto;max-width:52rem;padding:0 1rem}
+h1{font-size:1.3rem}h2{font-size:1rem;margin-top:1.5rem}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:.35rem .6rem;text-align:left}
+th{background:#f4f4f4}code{background:#f4f4f4;padding:0 .3rem}
+.btn{margin:.25rem .5rem .25rem 0;padding:.4rem .9rem;cursor:pointer}
+.ok{color:#0a7a2f}.bad{color:#b3261e}.warn{color:#9a6b00}
+pre{background:#f4f4f4;padding:.8rem;overflow-x:auto}
+</style></head><body>
+<h1>DeskBridge <small id="app"></small></h1>
+<p>profile: <b id="profile"></b> &middot; role: <span id="role"></span> &middot;
+engine: <span id="engine"></span> &middot; unit: <span id="unit"></span></p>
+<div>
+<button class="btn" onclick="act('start')">start</button>
+<button class="btn" onclick="act('stop')">stop</button>
+<button class="btn" onclick="act('repair')">repair</button>
+</div>
+<h2>config</h2><div id="config" class="ok"></div>
+<h2>checks</h2><table id="checks"><tr><th></th><th>check</th><th>detail</th><th>fix</th></tr></table>
+<h2>log</h2><pre id="log"></pre>
+<h2>last action</h2><pre id="action"></pre>
+<script>
+const T = new URLSearchParams(location.search).get("t") || "";
+async function api(path, method) {
+  const r = await fetch(path + (path.includes("?") ? "&" : "?") + "t=" + encodeURIComponent(T), {method});
+  if (!r.ok) throw new Error((await r.json()).error || r.status);
+  return r.json();
+}
+async function refresh() {
+  try {
+    const s = await api("/api/status", "GET");
+    document.getElementById("app").textContent = s.app || "";
+    document.getElementById("profile").textContent = s.profile;
+    document.getElementById("role").textContent = s.role || "-";
+    document.getElementById("engine").textContent = "v" + s.engine_version;
+    document.getElementById("unit").textContent = (s.unit.active ? "active" : "inactive") + " (" + s.unit.name + ")";
+    const cfg = document.getElementById("config");
+    cfg.textContent = s.config_errors.length ? "INVALID: " + s.config_errors.join("; ") : "valid";
+    cfg.className = s.config_errors.length ? "bad" : "ok";
+    const tb = document.getElementById("checks");
+    tb.innerHTML = "<tr><th></th><th>check</th><th>detail</th><th>fix</th></tr>";
+    for (const c of s.checks || []) {
+      tb.insertAdjacentHTML("beforeend",
+        `<tr><td class="${c.status}">${c.status.toUpperCase()}</td><td>${c.what}</td><td>${c.detail||""}</td><td>${c.fix||""}</td></tr>`);
+    }
+    document.getElementById("log").textContent = (s.log_tail || []).join("\\n") || "(no log yet)";
+  } catch (e) { document.getElementById("config").textContent = "status error: " + e; }
+}
+async function act(kind) {
+  document.getElementById("action").textContent = kind + " ...";
+  try {
+    const r = await api("/api/" + kind, "POST");
+    document.getElementById("action").textContent = JSON.stringify(r, null, 2);
+  } catch (e) { document.getElementById("action").textContent = "error: " + e; }
+  refresh();
+}
+refresh();
+setInterval(refresh, 3000);
+</script></body></html>
+"""
+
+
+def cmd_serve(args) -> int:
+    paths = Paths(args.profile)
+    token = secrets.token_urlsafe(16)
+    state_ref = {"token": token, "paths": paths}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _token_ok(self) -> bool:
+            q = parse_qs(urlparse(self.path).query)
+            return bool(q.get("t")) and secrets.compare_digest(q["t"][0], state_ref["token"])
+
+        def _json(self, obj, code: int = 200):
+            data = json.dumps(obj, indent=2, sort_keys=True).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path.split("?")[0] == "/":
+                data = WEB_HTML.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            elif self.path.split("?")[0] == "/api/status":
+                if not self._token_ok():
+                    return self._json({"error": "bad token"}, 401)
+                st = adopt_state(state_ref["paths"], load_state(state_ref["paths"]))
+                s = collect_status(state_ref["paths"], st)
+                s["app"] = app_version()
+                s["checks"] = _diagnose_checks(state_ref["paths"], st)
+                return self._json(s)
+            return self._json({"error": "not found"}, 404)
+
+        def do_POST(self):
+            if not self._token_ok():
+                return self._json({"error": "bad token"}, 401)
+            p = self.path.split("?")[0]
+            st = adopt_state(state_ref["paths"], load_state(state_ref["paths"]))
+            try:
+                if p == "/api/start":
+                    res = start_engine(state_ref["paths"], st)
+                elif p == "/api/stop":
+                    res = stop_engine(state_ref["paths"])
+                elif p == "/api/repair":
+                    out: dict = {"config": {"rewritten": False}}
+                    errs = validate_conf(state_ref["paths"], st)
+                    if errs or not state_ref["paths"].engine_conf.is_file():
+                        out["config"] = {"rewritten": True, "backups": write_engine_conf(state_ref["paths"], st)}
+                        if st.get("role") == "server":
+                            write_server_map(state_ref["paths"], st)
+                    out["cert"] = ensure_cert(state_ref["paths"])
+                    out["config_errors"] = validate_conf(state_ref["paths"], st)
+                    res = out
+                else:
+                    return self._json({"error": "not found"}, 404)
+            except SystemExit:
+                res = {"error": "command not permitted in this state"}
+            except Exception as e:  # noqa: BLE001 - report, don't crash the UI
+                res = {"error": str(e)}
+            self._json(res)
+
+    port = args.port or WEB_DEFAULT_PORT
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}/?t={token}"
+    print(f"{APP} web ui on {url}", file=sys.stderr)
+    print("(token is in this URL; bound to 127.0.0.1 only; Ctrl-C to stop)", file=sys.stderr)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="deskbridge",
+        description="Guided keyboard/mouse/clipboard sharing over Deskflow "
+                    "(thin product layer; the Deskflow engine does the work).",
+    )
+    p.add_argument("--profile", default="default",
+                   help="profile name (default: 'default'; more profiles isolate config/state/engine per LAN/peer)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd")
+
+    def add(name, fn, help_, setup_extra: bool = False):
+        sp = sub.add_parser(name, help=help_, description=help_)
+        sp.set_defaults(fn=fn)
+        if setup_extra:
+            sp.add_argument("--role", choices=("server", "client"))
+            sp.add_argument("--peer", help="peer address (server IP for a client)")
+            sp.add_argument("--name", help="computer name for this machine")
+            sp.add_argument("--side", choices=tuple(SIDES), help="screen edge (server role only)")
+            sp.add_argument("--port", type=int)
+            sp.add_argument("--engine", choices=("gui", "core"))
+            sp.add_argument("--autostart", choices=("on", "off"),
+                            help="start at login (default: ask; re-runs keep the current setting)")
+            sp.add_argument("--start-now", action="store_true", help="start the engine when the wizard ends")
+            sp.add_argument("--yes", action="store_true", help="accept all defaults, no prompts")
+        return sp
+
+    add("version", cmd_version, "show DeskBridge and engine versions")
+    add("setup", cmd_setup, "guided setup wizard (role, peer, screen placement, TLS, firewall)", setup_extra=True)
+    add("start", cmd_start, "start the engine for this profile")
+    add("stop", cmd_stop, "stop the engine for this profile")
+    add("restart", cmd_restart, "stop then start")
+    add("status", cmd_status, "show profile state, engine, processes, tcp, tls, firewall, log tail")
+    add("diagnose", cmd_diagnose, "run all checks with suggested fixes")
+    add("repair", cmd_repair, "rewrite engine config from state, regenerate cert, re-scope firewall")
+    add("fingerprint", cmd_fingerprint, "show this machine's TLS fingerprint (compare at the other machine)")
+    sp = add("trust", cmd_trust, "list/add/remove trusted peer fingerprints")
+    sp.add_argument("trust_cmd", choices=("list", "add", "remove"), nargs="?", default="list")
+    sp.add_argument("fingerprint", nargs="?", help="fingerprint (v2:sha256:<64 hex> or bare hex)")
+    sp = add("discover", cmd_discover, "find engines on the LAN (passive) or fetch a server fingerprint (--deep)")
+    sp.add_argument("--peer", help="address to probe (required with --deep)")
+    sp.add_argument("--deep", action="store_true", help="TLS handshake to fetch the peer certificate fingerprint")
+    sp.add_argument("--cidr", help="scan this network instead of local networks")
+    sp.add_argument("--port", type=int)
+    add("layout", cmd_layout, "show local input layouts (install the same on the other machine)")
+    sp = add("serve", cmd_serve, "local web UI (127.0.0.1, token-protected)")
+    sp.add_argument("--port", type=int, help=f"listen port (default {WEB_DEFAULT_PORT})")
+    sp = add("uninstall", cmd_uninstall, "stop, remove product state and scoped firewall rule; keep the engine")
+
+    args = p.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        p.print_help()
+        return 0
+    if args.cmd == "trust" and args.trust_cmd in ("add", "remove") and not args.fingerprint:
+        p.error("trust add/remove needs a fingerprint")
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
