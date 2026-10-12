@@ -27,11 +27,13 @@ import shutil
 import socket
 import ssl
 import stat
+import tempfile
 import subprocess
 import sys
 import threading
 import time
 import zlib
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -79,6 +81,8 @@ class Paths:
     """All file paths for one profile, isolated per profile."""
 
     def __init__(self, profile: str, home: pathlib.Path | None = None):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", profile):
+            raise ValueError("profile must be 1-48 letters, digits, underscores or hyphens")
         self.profile = profile
         self.home = (home or pathlib.Path(os.path.expanduser("~"))).resolve()
         self.config_root = self.home / ".config"
@@ -98,11 +102,19 @@ class Paths:
         self.engine_conf = self.engine_home / "Deskflow.conf"
         self.tls_dir = self.engine_home / "tls"
         self.cert = self.tls_dir / "deskflow.pem"
-        self.trust_db = self.tls_dir / "trusted-servers"
+        self.role = None
         self.server_map = self.engine_home / "server.config"
         self.port = DEFAULT_PORT if profile == "default" else (
             DEFAULT_PORT + 1 + zlib.crc32(profile.encode()) % 100
         )
+
+    @property
+    def trust_db(self):
+        role = self.role or load_state(self).get("role")
+        if not role:
+            role = "server" if read_engine_conf(self).get("core.coreMode") == "2" else "client"
+        self.role = role
+        return self.tls_dir / ("trusted-clients" if role == "server" else "trusted-servers")
 
 
 def die(msg: str, code: int = 1, json_out: dict | None = None):
@@ -120,7 +132,7 @@ def sudo_prefix() -> list[str]:
     if os.geteuid() == 0:
         return []
     if shutil.which("sudo"):
-        return ["sudo"]
+        return ["sudo", "-n"]
     return []
 
 
@@ -139,10 +151,17 @@ def parse_version(text: str):
 
 def atomic_write(path: pathlib.Path, text: str, mode: int = 0o600):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    if path.is_file() and path.read_text() == text:
+        return
+    fd, name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
 
 
 def default_state(profile: str) -> dict:
@@ -168,6 +187,8 @@ def load_state(paths: Paths) -> dict:
     if paths.state_file.is_file():
         try:
             data = json.loads(paths.state_file.read_text())
+            if not isinstance(data, dict) or data.get("role") not in (None, "server", "client") or data.get("engine", "gui") not in ENGINE_BINARIES:
+                raise ValueError("Invalid profile state; restore its backup or run setup with a valid state file")
             st.update(data)
         except (json.JSONDecodeError, OSError):
             pass
@@ -177,6 +198,7 @@ def load_state(paths: Paths) -> dict:
 def save_state(paths: Paths, st: dict):
     st["updated"] = now_iso()
     atomic_write(paths.state_file, json.dumps(st, indent=2, sort_keys=True) + "\n")
+    os.chmod(paths.app_home, 0o700)
 
 
 # ---------------------------------------------------------------- config
@@ -221,60 +243,72 @@ def validate_conf(paths: Paths, st: dict) -> list[str]:
     if st["role"] == "client":
         if not flat.get("client.remoteHost", ""):
             errors.append("client.remoteHost empty")
-    _conf_text = paths.engine_conf.read_text()
-    if re.search(r"^\s*externalConfigFile\s*=", _conf_text, re.M) and re.search(r"^\[internalConfig\]", _conf_text, re.M):
-        errors.append("externalConfigFile and internalConfig cannot both be present")
-    sec = flat.get("security.tlsEnabled", "")
-    if sec and not conf_bool(sec):
-        errors.append("security.tlsEnabled must be true (DeskBridge is TLS-only)")
+    if not flat:
+        errors.append("unparseable engine INI (including any malformed internalConfig section)")
+    for key in ("tlsEnabled", "checkPeerFingerprints"):
+        if not conf_bool(flat.get(f"security.{key}", "false")):
+            errors.append(f"security.{key} must be true")
+    if st.get("name") and flat.get("core.computerName") != st["name"]:
+        errors.append("core.computerName differs from profile")
+    if st.get("role") and flat.get("core.coreMode") != ("2" if st["role"] == "server" else "1"):
+        errors.append("core.coreMode differs from profile")
+    if st.get("port") and flat.get("core.port") != str(st["port"]):
+        errors.append("core.port differs from profile")
+    if st.get("role") == "server":
+        for name in st.get("map", {}):
+            if flat.get(f"computer_{name}.name") != name:
+                errors.append(f"missing computer definition: {name}")
     return errors
 
 
 def write_engine_conf(paths: Paths, st: dict) -> list[str]:
     """Write the engine config from state. Returns backup paths created."""
     backups = []
-    if paths.engine_conf.is_file():
-        bak = paths.engine_conf.with_name(paths.engine_conf.name + f".bak.{int(time.time())}")
-        bak.write_text(paths.engine_conf.read_text())
-        backups.append(str(bak))
     port = st.get("port") or paths.port
     name = st["name"]
     cp = configparser.ConfigParser(interpolation=None)
     cp.optionxform = str
-    cp.add_section("core")
-    cp["core"] = {
+    if paths.engine_conf.is_file():
+        try:
+            cp.read_string(paths.engine_conf.read_text())
+        except configparser.Error as e:
+            raise ValueError("Existing INI is malformed; restore its backup before setup") from e
+    def merge(section, values):
+        if not cp.has_section(section):
+            cp.add_section(section)
+        cp[section].update(values)
+    merge("core", {
         "computerName": name,
         "coreMode": "2" if st["role"] == "server" else "1",
         "port": str(port),
         "preventSleep": "false",
-    }
-    cp.add_section("client")
-    cp["client"] = {}
+        "processMode": "1",
+    })
     if st["role"] == "server":
-        cp.add_section("server")
-        cp["server"] = {
+        merge("server", {
             "externalConfig": "true",
             "externalConfigFile": str(paths.server_map),
             "enableClipboard": "true",
             "switchDelay": "250",
-        }
+        })
+        for computer in st.get("map", {}):
+            merge(f"computer_{computer}", {"name": computer})
     else:
-        cp["client"]["remoteHost"] = st["peer"] or ""
-    cp.add_section("security")
-    cp["security"] = {
+        merge("client", {"remoteHost": st["peer"] or ""})
+    merge("security", {
         "tlsEnabled": "true",
         "checkPeerFingerprints": "true",
         "keySize": str(CERT_KEY_SIZE),
-    }
-    cp.add_section("gui")
-    cp["gui"] = {
+    })
+    merge("gui", {
         "startCoreWithGui": "true",
         "closeToTray": "true",
         "autoHide": "false",
         "enableUpdateCheck": "false",
-    }
-    cp.add_section("log")
-    cp["log"] = {"file": str(paths.log_file), "level": "Info", "toFile": "true"}
+    })
+    merge("log", {"file": str(paths.log_file), "level": "Info", "toFile": "true"})
+    if st.get("quiet_layouts"):
+        cp["gui"]["ignoreMissingKeyboardLayouts"] = "true"
     buf = []
     for s in cp.sections():
         buf.append(f"[{s}]")
@@ -282,7 +316,13 @@ def write_engine_conf(paths: Paths, st: dict) -> list[str]:
             buf.append(f"{k} = {cp[s][k]}")
         buf.append("")
     paths.engine_home.mkdir(parents=True, exist_ok=True)
-    atomic_write(paths.engine_conf, "\n".join(buf), 0o600)
+    text = "\n".join(buf)
+    if paths.engine_conf.is_file() and paths.engine_conf.read_text() != text:
+        bak = paths.engine_conf.with_name(paths.engine_conf.name + f".bak.{time.time_ns()}")
+        atomic_write(bak, paths.engine_conf.read_text())
+        backups.append(str(bak))
+    paths.log_file.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(paths.engine_conf, text, 0o600)
     return backups
 
 
@@ -292,7 +332,8 @@ def write_server_map(paths: Paths, st: dict) -> None:
     for computer, neighbors in sorted((st.get("map") or {}).items()):
         lines.append(f"{computer}:")
         for side, other in sorted(neighbors.items()):
-            lines.append(f"    {side} = {other}")
+            direction = {"top": "up", "bottom": "down"}.get(side, side)
+            lines.append(f"    {direction} = {other}")
     lines.append("end")
     lines.append("section: options")
     lines.append("    clipboardSharing = true")
@@ -300,6 +341,22 @@ def write_server_map(paths: Paths, st: dict) -> None:
     lines.append("")
     paths.engine_home.mkdir(parents=True, exist_ok=True)
     atomic_write(paths.server_map, "\n".join(lines), 0o600)
+
+
+def install_launchers(paths: Paths):
+    directory = paths.home / ".local/share/applications"
+    def quote(value):
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%') + '"'
+    for action in ("start", "stop"):
+        path = directory / f"deskbridge-{paths.profile}-{action}.desktop"
+        if path.exists() and f"X-DeskBridge-Profile={paths.profile}" not in path.read_text():
+            raise ValueError(f"Refusing to replace an unowned launcher: {path}")
+        text = "\n".join(["[Desktop Entry]", "Type=Application",
+            f"Name={action.title()} DeskBridge ({paths.profile})",
+            "Icon=org.deskflow.deskflow", "Terminal=false", "StartupNotify=false",
+            "Exec=" + " ".join(quote(v) for v in (sys.executable, pathlib.Path(__file__).resolve(), "--profile", paths.profile, action)),
+            f"X-DeskBridge-Profile={paths.profile}", "Categories=Utility;", ""])
+        atomic_write(path, text, 0o644)
 
 
 # ---------------------------------------------------------------- engine
@@ -329,9 +386,6 @@ def engine_ok(paths: Paths, st: dict) -> tuple[bool, str]:
     bins = engine_binaries(paths)
     kind = st.get("engine") or "gui"
     if not bins.get(kind):
-        other = "core" if kind == "gui" else "gui"
-        if bins.get(other):
-            return True, f"engine '{kind}' missing; falling back to '{other}'"
         return False, f"engine binary not found: {ENGINE_BINARIES[kind]}"
     probe = bins.get("core")
     ver = engine_version(probe) if probe else "unknown"
@@ -351,6 +405,8 @@ def find_engine_processes() -> list[dict]:
         return procs
     for pid in pids:
         try:
+            if pathlib.Path(f"/proc/{pid}").stat().st_uid != os.getuid():
+                continue
             comm = pathlib.Path(f"/proc/{pid}/comm").read_text().strip()
         except OSError:
             continue
@@ -372,18 +428,11 @@ def profile_processes(paths: Paths) -> list[dict]:
     out = []
     for p in find_engine_processes():
         env, cmd = p["environ"], p["cmdline"].encode()
-        if paths.profile == "default":
-            if b"XDG_CONFIG_HOME=" in env:
-                xdg = env.split(b"XDG_CONFIG_HOME=", 1)[1].split(b"\0", 1)[0]
-                if b"DeskBridge" in xdg:
-                    continue  # belongs to an isolated profile
+        variables = set(env.split(b"\0"))
+        if f"DESKBRIDGE_PROFILE={paths.profile}".encode() in variables:
             out.append(p)
-        else:
-            if paths.xdg and b"XDG_CONFIG_HOME=" + str(paths.xdg).encode() in env:
-                out.append(p)
-                continue
-            if b"-s " + str(paths.engine_conf).encode() in cmd:
-                out.append(p)
+        elif paths.xdg and b"XDG_CONFIG_HOME=" + str(paths.xdg).encode() in variables:
+            out.append(p)
     return out
 
 
@@ -411,50 +460,96 @@ def unit_main_pid(paths: Paths) -> int | None:
 
 def supervisor_env(paths: Paths, st: dict) -> list[str]:
     """systemd-run arguments that isolate this profile from others."""
-    args = []
+    args = [f"--setenv=DESKBRIDGE_PROFILE={paths.profile}"]
     if paths.xdg:
         paths.xdg.mkdir(parents=True, exist_ok=True)
         args.append(f"--setenv=XDG_CONFIG_HOME={paths.xdg}")
     return args
 
 
-def start_engine(paths: Paths, st: dict) -> dict:
+def unit_file(paths: Paths) -> pathlib.Path:
+    return paths.config_root / "systemd/user" / f"{paths.unit}.service"
+
+
+def engine_command(paths: Paths, st: dict) -> list[str]:
     kind = st.get("engine") or "gui"
     binary = shutil.which(ENGINE_BINARIES[kind])
-    fallback = ""
     if not binary:
-        other = "core" if kind == "gui" else "gui"
-        binary = shutil.which(ENGINE_BINARIES[other])
-        kind, fallback = other, f"engine '{st.get('engine')}' missing; using '{other}'"
-    if not binary:
-        return {"started": False, "error": f"engine binary not found ({ENGINE_BINARIES[kind] or 'deskflow'})"}
+        raise ValueError(f"engine binary not found: {ENGINE_BINARIES[kind]}")
     cmd = [binary]
-    if kind == "core" and paths.xdg:
-        cmd += ["-s", str(paths.engine_conf)]
-    unit_args = [
-        "systemd-run", "--user", "--unit", paths.unit, "--collect",
-        "--property=Restart=on-failure", "--property=RestartSec=3",
-        *supervisor_env(paths, st),
-    ] + cmd
+    if kind == "core":
+        cmd += [st["role"], "--new-instance", "--settings", str(paths.engine_conf)]
+    return cmd
+
+
+def write_unit(paths: Paths, st: dict):
+    def quote(value):
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+    path = unit_file(paths)
+    if path.exists() and "# Managed by DeskBridge" not in path.read_text():
+        raise ValueError(f"Refusing to replace an unowned unit: {path}")
+    env = [f"DESKBRIDGE_PROFILE={paths.profile}"]
+    if paths.xdg:
+        env += [f"XDG_CONFIG_HOME={paths.xdg}", f"XDG_STATE_HOME={paths.app_home / 'engine-state'}"]
+    text = "\n".join([
+        "# Managed by DeskBridge", "[Unit]", "Description=DeskBridge input sharing",
+        "After=graphical-session.target", "PartOf=graphical-session.target",
+        "StartLimitIntervalSec=60", "StartLimitBurst=3", "[Service]", "Type=simple",
+        "ExecStart=" + " ".join(quote(x) for x in engine_command(paths, st)),
+        *["Environment=" + quote(x) for x in env],
+        "Restart=on-failure", "RestartSec=5", "TimeoutStopSec=8", "KillMode=control-group",
+        "[Install]", "WantedBy=graphical-session.target", "",
+    ])
+    atomic_write(path, text, 0o600)
+    r = run(["systemctl", "--user", "daemon-reload"])
+    if r.returncode:
+        raise ValueError(r.stderr.strip() or "user systemd manager unavailable")
+
+
+def start_engine(paths: Paths, st: dict) -> dict:
+    kind = st.get("engine") or "gui"
+    if not st.get("role") or not st.get("name"):
+        return {"started": False, "error": "run setup first"}
+    ok, note = engine_ok(paths, st)
+    if not ok:
+        return {"started": False, "error": note}
+    errs = validate_conf(paths, st)
+    if errs:
+        return {"started": False, "error": "; ".join(errs)}
+    if not cert_fingerprint(paths):
+        return {"started": False, "error": "missing or invalid TLS certificate; run repair"}
+    if unit_active(paths) and profile_processes(paths):
+        return {"started": True, "already_running": True, "unit": paths.unit, "engine": kind}
+    if kind == "gui" and any(p["name"] == "deskflow" for p in find_engine_processes()):
+        return {"started": False, "error": "Deskflow GUI already running; close it first. Upstream allows one GUI per desktop user."}
     try:
-        r = run(unit_args, timeout=15)
-    except OSError as e:
-        return {"started": False, "error": f"systemd-run failed: {e}"}
+        write_unit(paths, st)
+        run(["systemctl", "--user", "reset-failed", paths.unit])
+        r = run(["systemctl", "--user", "start", paths.unit], timeout=15)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return {"started": False, "error": str(e)}
     if r.returncode != 0:
         return {"started": False, "error": (r.stderr or r.stdout).strip() or "systemd-run failed"}
-    time.sleep(1.0)
-    note = [x for x in (fallback,) if x]
-    return {"started": True, "unit": paths.unit, "engine": kind, "note": " ".join(note)}
+    time.sleep(1.5)
+    if not unit_active(paths) or not profile_processes(paths):
+        return {"started": False, "error": f"engine exited; inspect journalctl --user -u {paths.unit}"}
+    return {"started": True, "unit": paths.unit, "engine": kind,
+            "note": "Process is running; verify pairing, GNOME permission and physical input separately."}
 
 
 def stop_engine(paths: Paths, timeout: float = 8.0) -> dict:
     killed = []
     had_unit = unit_active(paths)
     if had_unit:
+        path = unit_file(paths)
+        if not (path.is_file() and "# Managed by DeskBridge" in path.read_text()) and not profile_processes(paths):
+            return {"stopped": False, "error": "unit is not owned by DeskBridge", "unit_was_active": True, "pids_terminated": []}
         try:
-            run(["systemctl", "--user", "stop", paths.unit], timeout=15)
+            r = run(["systemctl", "--user", "stop", paths.unit], timeout=15)
+            if r.returncode:
+                return {"stopped": False, "error": r.stderr.strip(), "unit_was_active": True, "pids_terminated": []}
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            return {"stopped": False, "error": "user unit stop failed", "unit_was_active": True, "pids_terminated": []}
     deadline = time.time() + timeout
     while time.time() < deadline:
         procs = profile_processes(paths)
@@ -476,13 +571,18 @@ def stop_engine(paths: Paths, timeout: float = 8.0) -> dict:
             pass
     if leftovers:
         time.sleep(0.5)
-    return {"stopped": True, "unit_was_active": had_unit, "pids_terminated": killed}
+    remaining = [p["pid"] for p in profile_processes(paths)]
+    return {"stopped": not remaining and not unit_active(paths), "remaining": remaining,
+            "unit_was_active": had_unit, "pids_terminated": sorted(set(killed))}
 
 
 # ---------------------------------------------------------------- firewall
 
 def rich_rule(peer: str, port: int) -> str:
-    return f'rule family="ipv4" source address="{peer}" port port="{port}" protocol="tcp" accept'
+    address = ipaddress.ip_address(peer)
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("invalid port")
+    return f'rule family="ipv{address.version}" source address="{address}" port port="{port}" protocol="tcp" accept'
 
 
 def firewall_state() -> str:
@@ -527,6 +627,8 @@ def firewall_remove(paths: Paths, peer: str, port: int) -> dict:
 
 def ensure_cert(paths: Paths) -> dict:
     if paths.cert.is_file():
+        if not cert_fingerprint(paths):
+            return {"created": False, "error": "Existing certificate is invalid; restore it rather than silently changing identity"}
         return {"created": False, "path": str(paths.cert)}
     if not shutil.which("openssl"):
         return {"created": False, "error": "openssl not found"}
@@ -556,6 +658,13 @@ def ensure_cert(paths: Paths) -> dict:
 def cert_fingerprint(paths: Paths) -> str | None:
     if not paths.cert.is_file():
         return None
+    expiry = run(["openssl", "x509", "-in", str(paths.cert), "-noout", "-checkend", "0"], timeout=10)
+    if expiry.returncode:
+        return None
+    cert_key = run(["openssl", "x509", "-in", str(paths.cert), "-pubkey", "-noout"], timeout=10)
+    private_key = run(["openssl", "pkey", "-in", str(paths.cert), "-pubout", "-passin", "pass:"], timeout=10)
+    if cert_key.returncode or private_key.returncode or cert_key.stdout.strip() != private_key.stdout.strip():
+        return None
     r = run(["openssl", "x509", "-in", str(paths.cert), "-noout", "-fingerprint", "-sha256"], timeout=10)
     if r.returncode != 0:
         return None
@@ -566,7 +675,7 @@ def cert_fingerprint(paths: Paths) -> str | None:
 def fingerprint_canon(fp: str) -> str:
     m = FINGERPRINT_RE.match(fp.strip())
     if not m:
-        raise ValueError(f"invalid fingerprint (want v2:sha256:<64 hex>): {fp!r}")
+        raise ValueError("invalid fingerprint (want v2:sha256:<64 hex>)")
     return f"v2:sha256:{m.group(2).lower()}"
 
 
@@ -614,28 +723,33 @@ def local_networks() -> list[tuple[str, str]]:
         return nets
     for line in r.stdout.splitlines():
         parts = line.split()
-        if len(parts) >= 5:
-            iface, prefix, addr = parts[1], parts[3], parts[4]
+        if len(parts) >= 4 and parts[2] == "inet":
+            iface, address = parts[1], parts[3]
             if iface == "lo":
                 continue
+            addr, prefix = address.split("/", 1)
             nets.append((addr, prefix))
     return nets
 
 
 def discover(cidr: str | None, port: int, timeout: float = 0.35, workers: int = 64) -> list[dict]:
-    """Passive scan: which addresses have the engine port open. No protocol
-    traffic is sent, so no pairing prompts are triggered on the peers."""
-    import ipaddress
+    """Bounded TCP connect scan; an open port does not identify Deskflow."""
     hosts: list[str] = []
     if cidr:
-        for ip in ipaddress.ip_network(cidr, strict=False):
-            hosts.append(str(ip))
+        net = ipaddress.ip_network(cidr, strict=False)
+        if net.version != 4 or net.num_addresses > 1024:
+            raise ValueError("Scan requires an IPv4 network with at most 1024 addresses")
+        hosts = [str(ip) for ip in net.hosts()]
     else:
         seen = set()
         for addr, prefix in local_networks():
             try:
                 net = ipaddress.ip_interface(f"{addr}/{prefix}").network
             except ValueError:
+                continue
+            if net.version != 4 or net.num_addresses > 1024:
+                continue
+            if not any(net.subnet_of(ipaddress.ip_network(lan)) for lan in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
                 continue
             for ip in net.hosts():
                 s = str(ip)
@@ -667,15 +781,12 @@ def deep_probe(ip: str, port: int, cert_path: pathlib.Path, timeout: float = 6.0
                 peer = tls.getpeercert(binary_form=True)
                 if not peer:
                     return {"ok": False, "error": "peer presented no certificate"}
-                cert = ssl.X509Cert()
-                cert.load_der_x509_cert(peer)
-                der = cert.public_bytes(serialization_format=ssl.Encoding.DER)
                 return {
                     "ok": True,
                     "ip": ip,
                     "port": port,
-                    "fingerprint": f"v2:sha256:{hashlib.sha256(der).hexdigest()}",
-                    "subject": dict(x[0] for x in cert.subject),
+                    "fingerprint": f"v2:sha256:{hashlib.sha256(peer).hexdigest()}",
+                    "verified": False,
                 }
     except ssl.SSLError as e:
         return {"ok": False, "error": f"tls handshake failed: {e}"}
@@ -707,7 +818,9 @@ def log_tail(paths: Paths, n: int = 6) -> list[str]:
     if not paths.log_file.is_file():
         return []
     try:
-        lines = paths.log_file.read_text().splitlines()
+        with paths.log_file.open("rb") as stream:
+            stream.seek(max(0, paths.log_file.stat().st_size - 65536))
+            lines = stream.read().decode(errors="replace").splitlines()
     except OSError:
         return []
     out = []
@@ -748,11 +861,13 @@ def collect_status(paths: Paths, st: dict) -> dict:
     procs = profile_processes(paths)
     tcp = []
     if shutil.which("ss"):
-        r = run(["ss", "-tn", "state", "established", "state", "syn-sent", "state", "syn-recv"], timeout=10)
-        for line in r.stdout.splitlines()[1:]:
+        r = run(["ss", "-Htn"], timeout=10)
+        for line in r.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 5 and (parts[4].endswith(f":{port}") or parts[3].endswith(f":{port}")):
-                tcp.append({"local": parts[4], "peer": parts[5] if len(parts) > 5 else parts[3], "state": parts[1]})
+                if st.get("peer") and st["peer"] not in parts[4]:
+                    continue
+                tcp.append({"local": parts[3], "peer": parts[4], "state": parts[0]})
     bins = engine_binaries(paths)
     ok, note = engine_ok(paths, st)
     return {
@@ -776,8 +891,9 @@ def collect_status(paths: Paths, st: dict) -> dict:
             "fingerprint": cert_fingerprint(paths),
             "trusted_peers": trust_lines(paths),
         },
-        "firewall": {"state": firewall_state(), "scoped": bool(st.get("firewall_scoped"))},
-        "autostart": bool(st.get("autostart")),
+        "firewall": {"state": firewall_state(), "peer_rule_recorded": bool(st.get("firewall_scoped")),
+                     "scoped": False, "note": "An accept rule alone does not prove other firewall rules restrict access."},
+        "autostart": autostart_enabled(paths),
         "log_tail": log_tail(paths),
     }
 
@@ -790,9 +906,29 @@ def adopt_state(paths: Paths, st: dict) -> dict:
     mode = flat.get("core.coreMode", "")
     if mode not in ("1", "2"):
         return st
-    return dict(st, role="client" if mode == "1" else "server",
+    result = dict(st, role="client" if mode == "1" else "server",
                 name=st.get("name") or flat.get("core.computerName", ""),
                 peer=st.get("peer") or flat.get("client.remoteHost", ""))
+    try:
+        result["port"] = int(flat.get("core.port", paths.port))
+    except ValueError:
+        pass
+    if mode == "2" and paths.server_map.is_file():
+        links, current, in_links = {}, None, False
+        for line in paths.server_map.read_text().splitlines():
+            line = line.strip()
+            if line == "section: links":
+                in_links = True
+            elif line == "end":
+                in_links = False
+            elif in_links and line.endswith(":"):
+                current = line[:-1]
+                links[current] = {}
+            elif in_links and current and "=" in line:
+                edge, neighbor = (x.strip() for x in line.split("=", 1))
+                links[current][{"up": "top", "down": "bottom"}.get(edge, edge)] = neighbor
+        result["map"] = links
+    return result
 
 
 def cmd_status(args) -> int:
@@ -842,13 +978,11 @@ def require_configured(paths: Paths, st: dict) -> None:
 
 def cmd_start(args) -> int:
     paths = Paths(args.profile)
-    st = load_state(paths)
+    st = adopt_state(paths, load_state(paths))
     require_configured(paths, st)
     ok, note = engine_ok(paths, st)
     if not ok:
         die(note, 3)
-    if profile_processes(paths):
-        die("engine for this profile is already running", 4)
     res = start_engine(paths, st)
     if not res.get("started"):
         die(res.get("error", "start failed"), 5)
@@ -873,12 +1007,13 @@ def cmd_stop(args) -> int:
             print("terminated pid(s): " + ", ".join(map(str, res["pids_terminated"])))
         if not res["unit_was_active"] and not res["pids_terminated"]:
             print("engine not running")
-    return 0
+    return 0 if res["stopped"] else 5
 
 
 def cmd_restart(args) -> int:
     paths = Paths(args.profile)
-    stop_engine(paths)
+    if not stop_engine(paths)["stopped"]:
+        die("stop failed; refusing to start a second engine", 5)
     return cmd_start(args)
 
 
@@ -937,8 +1072,8 @@ def cmd_discover(args) -> int:
         elif res.get("ok"):
             print(f"engine found at {res['ip']}:{res['port']}")
             print(f"server fingerprint: {res['fingerprint']}")
-            print(f"subject: {res['subject'].get('commonName', '?')}")
-            print(f"add to trust store: deskbridge --profile {paths.profile} trust add {res['fingerprint']}")
+            print("UNVERIFIED: compare the complete fingerprint at the server before adding trust.")
+            print(f"after comparison: deskbridge --profile {paths.profile} trust add {res['fingerprint']}")
         else:
             die(res.get("error", "deep probe failed"), 3)
         return 0
@@ -951,7 +1086,7 @@ def cmd_discover(args) -> int:
         for f in found:
             mark = "  <- current peer" if f["ip"] == st.get("peer") else ""
             print(f"{f['ip']}:{f['port']} tcp open{mark}")
-        print("(passive scan: no protocol traffic sent)")
+        print("(TCP connect scan; an open port does not identify Deskflow)")
     return 0
 
 
@@ -980,6 +1115,8 @@ def autostart_enabled(paths: Paths) -> bool:
 
 
 def autostart_set(paths: Paths, enable: bool, st: dict) -> dict:
+    if enable:
+        write_unit(paths, st)
     if enable and not autostart_enabled(paths):
         r = run(["systemctl", "--user", "enable", paths.unit], timeout=15)
         if r.returncode != 0:
@@ -989,6 +1126,17 @@ def autostart_set(paths: Paths, enable: bool, st: dict) -> dict:
         if r.returncode != 0:
             return {"enabled": True, "error": (r.stderr or r.stdout).strip()}
     return {"enabled": autostart_enabled(paths)}
+
+
+def cmd_autostart(args) -> int:
+    paths = Paths(args.profile)
+    st = adopt_state(paths, load_state(paths))
+    require_configured(paths, st)
+    res = autostart_set(paths, args.mode == "on", st) if args.mode != "status" else {"enabled": autostart_enabled(paths)}
+    st["autostart"] = res["enabled"]
+    save_state(paths, st)
+    print(json.dumps(res) if args.json else f"Autostart {'on' if res['enabled'] else 'off'}" + (f": {res['error']}" if res.get("error") else ""))
+    return 1 if res.get("error") else 0
 
 
 # ---------------------------------------------------------------- wizard
@@ -1006,7 +1154,9 @@ def ask(prompt: str, default: str | None, args) -> str:
 
 def cmd_setup(args) -> int:
     paths = Paths(args.profile)
-    st = load_state(paths)
+    st = adopt_state(paths, load_state(paths))
+    if profile_processes(paths) or (paths.profile == "default" and any(p["name"] == "deskflow" for p in find_engine_processes())):
+        die("stop the existing Deskflow instance before changing its configuration", 2)
     adopted = st.get("wizard_done") or paths.engine_conf.is_file()
     results: dict = {}
 
@@ -1024,11 +1174,11 @@ def cmd_setup(args) -> int:
     peer_default = args.peer or st.get("peer")
     if st["role"] == "client":
         if not peer_default:
-            found = discover(None, paths.port)
+            found = discover(None, paths.port) if not args.yes else []
             cands = [f["ip"] for f in found]
             if cands and not args.yes:
                 print("engines found on this LAN: " + ", ".join(cands))
-            peer_default = cands[0] if cands else None
+            peer_default = None
         st["peer"] = ask("server address (IP of the machine with keyboard+mouse)", peer_default, args)
         if not st["peer"]:
             die("client needs a server address", 2)
@@ -1039,11 +1189,19 @@ def cmd_setup(args) -> int:
     name_default = args.name or st.get("name") or (
         "fedora" if st["role"] == "client" else "windows")
     st["name"] = ask("computer name (must be unique across both machines)", name_default, args)
-    if not st["name"]:
-        die("a computer name is required", 2)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", st["name"]):
+        die("computer name must be 1-64 letters, digits, underscores or hyphens", 2)
 
     # 4. port
-    st["port"] = int(args.port or st.get("port") or paths.port)
+    st["port"] = int(args.port if args.port is not None else st.get("port") or paths.port)
+    if not 1 <= st["port"] <= 65535:
+        die("port must be between 1 and 65535", 2)
+    if st.get("peer"):
+        try:
+            ipaddress.ip_address(st["peer"])
+        except ValueError:
+            if st["role"] == "server" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", st["peer"]):
+                die("peer must be an IP address (client may use a DNS hostname)", 2)
 
     # 5. screen placement (server only)
     if st["role"] == "server":
@@ -1051,32 +1209,39 @@ def cmd_setup(args) -> int:
             side = args.side
         else:
             side = ask("which side is the client monitor on? (left/right/top/bottom)",
-                        (st.get("map") or {}).get(st["name"], {}).get("left", "left"), args)
+                        next(iter((st.get("map") or {}).get(st["name"], {})), "left"), args)
         if side not in SIDES:
             die("side must be left, right, top or bottom", 2)
         client_name = ask("name for the client machine (must match its computer name)",
-                           st.get("client_name") or "fedora", args)
+                           args.peer_name or st.get("client_name") or next(iter((st.get("map") or {}).get(st["name"], {}).values()), "fedora"), args)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", client_name) or client_name == st["name"]:
+            die("peer name must be valid and different from this computer name", 2)
         st["client_name"] = client_name
         st["map"] = {st["name"]: {side: client_name}, client_name: {SIDES[side]: st["name"]}}
 
     # 6. engine choice
     st["engine"] = args.engine or st.get("engine") or "gui"
+    paths.role = st["role"]
+    if args.quiet_layouts:
+        st["quiet_layouts"] = True
+    expected = fingerprint_canon(args.trust_fingerprint) if args.trust_fingerprint else None
 
     # 7. local certificate
     res = ensure_cert(paths)
     results["cert"] = res
+    if res.get("error"):
+        die(res["error"], 3)
     fp = cert_fingerprint(paths)
 
     # 8. pairing (client): fetch server fingerprint if reachable
-    if st["role"] == "client":
-        probe = deep_probe(st["peer"], st["port"], paths.cert) if not args.yes or args.peer else {"ok": False}
-        if probe.get("ok"):
-            if args.yes or ask(f"trust server fingerprint {probe['fingerprint'][:24]}\u2026 now?", "yes", args) in ("y", "yes"):
-                results["trust"] = trust_add(paths, probe["fingerprint"])
-            else:
-                results["trust"] = {"added": False, "note": "skipped; engine will show a confirm dialog on first connect"}
-        else:
-            results["trust"] = {"added": False, "note": probe.get("error") or "server not reachable yet; pairing dialog will appear on first connect"}
+    if expected:
+        if st["role"] == "client":
+            probe = deep_probe(st["peer"], st["port"], paths.cert)
+            if not probe.get("ok") or not secrets.compare_digest(probe.get("fingerprint", ""), expected):
+                die("server fingerprint could not be verified against the supplied fingerprint; no trust added", 3)
+        results["trust"] = trust_add(paths, expected)
+    else:
+        results["trust"] = {"added": False, "note": "Compare full fingerprints on BOTH PCs in the native pairing dialogs. --yes never accepts a new peer."}
 
     # 9. write configs
     backups = write_engine_conf(paths, st)
@@ -1098,9 +1263,9 @@ def cmd_setup(args) -> int:
 
     # 11. autostart
     if args.autostart is not None:
-        want = args.autostart
+        want = args.autostart == "on"
     else:
-        want = ask("start at login?", "yes" if adopted else "no", args) in ("y", "yes", "true")
+        want = ask("start at login?", "yes" if autostart_enabled(paths) else "no", args) in ("y", "yes", "true")
     if want:
         results["autostart"] = autostart_set(paths, True, st)
     else:
@@ -1112,6 +1277,7 @@ def cmd_setup(args) -> int:
         st["created"] = now_iso()
     save_state(paths, st)
     results["state"] = str(paths.state_file)
+    install_launchers(paths)
     results["config"] = str(paths.engine_conf)
     results["map"] = str(paths.server_map) if st["role"] == "server" else None
     results["fingerprint"] = f"v2:sha256:{fp}" if fp else None
@@ -1136,7 +1302,7 @@ def cmd_setup(args) -> int:
             edge = next(iter((st.get("map") or {}).get(st["name"], {})), "?")
             print(f"  screen map : client is on the {edge} edge")
             fw = results.get("firewall", {})
-            print(f"  firewall   : {'scoped to peer' if fw.get('applied') else fw.get('reason', 'n/a')}")
+            print(f"  firewall   : {'peer allow added; review other firewall policy' if fw.get('applied') else fw.get('reason', 'n/a')}")
         print(f"  certificate: {'created' if results['cert'].get('created') else 'kept existing'} {results['cert'].get('path', '')}")
         if fp:
             print(f"  fingerprint: v2:sha256:{fp}")
@@ -1154,7 +1320,7 @@ def cmd_setup(args) -> int:
             if lay:
                 print(f"  layouts    : local = {', '.join(lay)} (install the same on the server machine)")
         print("next: deskbridge start   (then move the cursor to the shared edge)")
-    return 0 if not errs else 6
+    return 0 if not errs and not results.get("autostart", {}).get("error") and not (args.start_now and not results.get("start", {}).get("started", False)) else 6
 
 
 
@@ -1163,7 +1329,9 @@ def cmd_setup(args) -> int:
 
 def cmd_repair(args) -> int:
     paths = Paths(args.profile)
-    st = load_state(paths)
+    st = adopt_state(paths, load_state(paths))
+    if profile_processes(paths) or (paths.profile == "default" and any(p["name"] == "deskflow" for p in find_engine_processes())):
+        die("stop this profile before repairing configuration", 2)
     if not st.get("role") or not st.get("name"):
         die("no state to repair from - run: deskbridge setup", 2)
     out: dict = {"profile": paths.profile}
@@ -1185,11 +1353,11 @@ def cmd_repair(args) -> int:
     else:
         print(f"repair: config {'rewritten' if out['config']['rewritten'] else 'ok'}"
               f", cert {'created' if res.get('created') else 'ok'}")
-        if out["firewall"]:
+        if out.get("firewall"):
             print(f"repair: firewall {out['firewall'].get('applied') or out['firewall'].get('reason')}")
         if out["config_errors"]:
             print("still invalid: " + "; ".join(out["config_errors"]), file=sys.stderr)
-    return 0 if not out["config_errors"] else 6
+    return 0 if not out["config_errors"] and not res.get("error") else 6
 
 
 # ---------------------------------------------------------------- uninstall
@@ -1200,50 +1368,38 @@ LEGACY_DESKTOP_NAMES = ("deskbridge-start.desktop", "deskbridge-stop.desktop")
 def cmd_uninstall(args) -> int:
     paths = Paths(args.profile)
     out: dict = {"profile": paths.profile}
+    if not paths.state_file.is_file():
+        print(json.dumps({"uninstalled": True, "already_absent": True}) if args.json else "profile already absent; engine data left intact")
+        return 0
     out["stop"] = stop_engine(paths)
+    if not out["stop"]["stopped"]:
+        die("stop failed; configuration left intact", 5)
     if autostart_enabled(paths):
         run(["systemctl", "--user", "disable", paths.unit], timeout=15)
-    for legacy in LEGACY_DESKTOP_NAMES:
-        for d in (paths.home / ".config/autostart", paths.home / ".local/share/applications"):
-            p = d / legacy
-            if p.is_file():
-                p.unlink()
-                out.setdefault("legacy_removed", []).append(str(p))
+    path = unit_file(paths)
+    if path.is_file() and "# Managed by DeskBridge" in path.read_text():
+        path.unlink()
+        run(["systemctl", "--user", "daemon-reload"])
+    for action in ("start", "stop"):
+        launcher = paths.home / ".local/share/applications" / f"deskbridge-{paths.profile}-{action}.desktop"
+        if launcher.is_file() and f"X-DeskBridge-Profile={paths.profile}" in launcher.read_text():
+            launcher.unlink()
     if paths.engine_conf.is_file():
         bak = paths.engine_conf.with_name(paths.engine_conf.name + f".uninstalled.{int(time.time())}")
         paths.engine_conf.replace(bak)
         out["config_backup"] = str(bak)
     if paths.server_map.is_file():
-        paths.server_map.unlink()
-        out["map_removed"] = True
+        backup = paths.server_map.with_name(paths.server_map.name + f".uninstalled.{time.time_ns()}")
+        paths.server_map.replace(backup)
+        out["map_backup"] = str(backup)
     st = load_state(paths)
     if st.get("role") == "server" and st.get("peer"):
         out["firewall"] = firewall_remove(paths, st["peer"], st.get("port") or paths.port)
     removed = []
-    for p in (paths.state_file, paths.server_map, paths.log_file):
+    for p in (paths.state_file, paths.log_file):
         if p.is_file():
             p.unlink()
             removed.append(str(p))
-    # Non-default profiles own their whole tree: sweep it, keeping TLS and
-    # the .uninstalled config backup. Default profile shares ~/.config/Deskflow
-    # with the engine, so only known product files go.
-    if paths.xdg is not None:
-        for root, dirs, files in os.walk(paths.app_home, topdown=False):
-            rp = pathlib.Path(root)
-            for f in files:
-                fp = rp / f
-                if fp.is_relative_to(paths.tls_dir) or fp.name.startswith(paths.engine_conf.name + ".uninstalled"):
-                    continue
-                try:
-                    fp.unlink()
-                    removed.append(str(fp))
-                except OSError:
-                    pass
-            try:
-                if not any(rp.iterdir()):
-                    rp.rmdir()
-            except OSError:
-                pass
     out["removed"] = removed
     out["state_removed"] = True
     if args.json:
@@ -1283,7 +1439,7 @@ def _diagnose_checks(paths: Paths, st: dict) -> list[dict]:
                        "what": what, "detail": detail, "fix": fix})
 
     ok, note = engine_ok(paths, st)
-    add(ok, not ok, f"engine installed (>= {ENGINE_MIN})", note or "ok", "dnf install deskflow")
+    add(ok, False, f"engine installed (>= {ENGINE_MIN})", note or "ok", "dnf install deskflow")
     if not st.get("role"):
         add(False, True, "configured", "no state found", "deskbridge setup")
         return checks
@@ -1313,7 +1469,7 @@ def cmd_diagnose(args) -> int:
             tls = trust_lines(paths)
             checks.append({"status": "pass" if tls else "warn", "what": "server fingerprint trusted",
                            "detail": f"{len(tls)} entry/entries",
-                           "fix": f"deskbridge discover --deep {peer}  (then: trust add <fp>)" if not tls else ""})
+                           "fix": f"deskbridge discover --deep --peer {peer} (compare full fingerprint at server before trust add)" if not tls else ""})
             lay = local_layouts()
             checks.append({"status": "pass" if lay else "warn", "what": "input layouts detected",
                            "detail": ", ".join(lay),
@@ -1329,17 +1485,17 @@ def cmd_diagnose(args) -> int:
                     r = run([*sudo_prefix(), "firewall-cmd",
                              f"--query-rich-rule={rich_rule(st['peer'], port)}"], timeout=15)
                     scoped = r.returncode == 0
-                checks.append({"status": "pass" if (fw != "running" or scoped) else "fail",
-                               "what": "firewall scoped to peer",
-                               "detail": "scoped" if scoped else ("firewalld not running" if fw != "running" else "open to all"),
-                               "fix": "" if (fw != "running" or scoped) else "deskbridge repair"})
+                checks.append({"status": "warn",
+                               "what": "firewall peer allow rule",
+                               "detail": "peer allow present; other rules/policies may allow more" if scoped else "peer allow rule not verified; review firewall policy",
+                               "fix": "review active zone and other services; deskbridge repair adds the peer allow"})
         procs = profile_processes(paths)
         if procs and st["role"] == "client":
             r = run(["ss", "-tn", "state", "established"], timeout=10)
             est = any(f":{port}" in ln for ln in r.stdout.splitlines())
             checks.append({"status": "pass" if est else "warn", "what": "tcp connection established",
                            "detail": "", "fix": "wait a moment, then check the log"})
-        checks.append({"status": "pass", "what": "display session", "detail": display_protocol(),
+        checks.append({"status": "warn" if display_protocol() == "none" else "pass", "what": "invoking display session", "detail": display_protocol(),
                        "fix": "run inside the desktop session" if display_protocol() == "none" else ""})
         tail = log_tail(paths, 3)
         checks.append({"status": "pass", "what": "recent log",
@@ -1347,7 +1503,7 @@ def cmd_diagnose(args) -> int:
 
     if args.json:
         print(json.dumps({"profile": paths.profile, "checks": checks}, indent=2, sort_keys=True))
-        return 0
+        return 1 if any(c["status"] == "fail" for c in checks) else 0
     for c in checks:
         mark = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}[c["status"]]
         line = f"  {mark}  {c['what']}"
@@ -1389,7 +1545,7 @@ engine: <span id="engine"></span> &middot; unit: <span id="unit"></span></p>
 <script>
 const T = new URLSearchParams(location.search).get("t") || "";
 async function api(path, method) {
-  const r = await fetch(path + (path.includes("?") ? "&" : "?") + "t=" + encodeURIComponent(T), {method});
+    const r = await fetch(path, {method, headers: {'X-DeskBridge-Token': T}});
   if (!r.ok) throw new Error((await r.json()).error || r.status);
   return r.json();
 }
@@ -1407,8 +1563,10 @@ async function refresh() {
     const tb = document.getElementById("checks");
     tb.innerHTML = "<tr><th></th><th>check</th><th>detail</th><th>fix</th></tr>";
     for (const c of s.checks || []) {
-      tb.insertAdjacentHTML("beforeend",
-        `<tr><td class="${c.status}">${c.status.toUpperCase()}</td><td>${c.what}</td><td>${c.detail||""}</td><td>${c.fix||""}</td></tr>`);
+      const row = tb.insertRow();
+      for (const value of [c.status.toUpperCase(), c.what, c.detail || '', c.fix || '']) {
+        row.insertCell().textContent = value;
+      }
     }
     document.getElementById("log").textContent = (s.log_tail || []).join("\\n") || "(no log yet)";
   } catch (e) { document.getElementById("config").textContent = "status error: " + e; }
@@ -1422,6 +1580,7 @@ async function act(kind) {
   refresh();
 }
 refresh();
+history.replaceState(null, '', '/');
 setInterval(refresh, 3000);
 </script></body></html>
 """
@@ -1431,14 +1590,28 @@ def cmd_serve(args) -> int:
     paths = Paths(args.profile)
     token = secrets.token_urlsafe(16)
     state_ref = {"token": token, "paths": paths}
+    lock = threading.RLock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def _token_ok(self) -> bool:
-            q = parse_qs(urlparse(self.path).query)
-            return bool(q.get("t")) and secrets.compare_digest(q["t"][0], state_ref["token"])
+            supplied = self.headers.get("X-DeskBridge-Token", "")
+            return self._local_request() and secrets.compare_digest(supplied, state_ref["token"])
+
+        def _local_request(self):
+            host = self.headers.get("Host", "")
+            expected = f"127.0.0.1:{self.server.server_port}"
+            origin = self.headers.get("Origin")
+            return host == expected and (origin is None or origin == "http://" + expected)
+
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+            super().end_headers()
 
         def _json(self, obj, code: int = 200):
             data = json.dumps(obj, indent=2, sort_keys=True).encode()
@@ -1449,6 +1622,8 @@ def cmd_serve(args) -> int:
             self.wfile.write(data)
 
         def do_GET(self):
+            if not self._local_request():
+                return self._json({"error": "local requests only"}, 403)
             if self.path.split("?")[0] == "/":
                 data = WEB_HTML.encode()
                 self.send_response(200)
@@ -1456,19 +1631,25 @@ def cmd_serve(args) -> int:
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                return
             elif self.path.split("?")[0] == "/api/status":
                 if not self._token_ok():
                     return self._json({"error": "bad token"}, 401)
-                st = adopt_state(state_ref["paths"], load_state(state_ref["paths"]))
-                s = collect_status(state_ref["paths"], st)
-                s["app"] = app_version()
-                s["checks"] = _diagnose_checks(state_ref["paths"], st)
+                with lock:
+                    st = adopt_state(state_ref["paths"], load_state(state_ref["paths"]))
+                    s = collect_status(state_ref["paths"], st)
+                    s["app"] = app_version()
+                    s["checks"] = _diagnose_checks(state_ref["paths"], st)
                 return self._json(s)
             return self._json({"error": "not found"}, 404)
 
         def do_POST(self):
             if not self._token_ok():
                 return self._json({"error": "bad token"}, 401)
+            with lock:
+                return self._post_locked()
+
+        def _post_locked(self):
             p = self.path.split("?")[0]
             st = adopt_state(state_ref["paths"], load_state(state_ref["paths"]))
             try:
@@ -1477,6 +1658,9 @@ def cmd_serve(args) -> int:
                 elif p == "/api/stop":
                     res = stop_engine(state_ref["paths"])
                 elif p == "/api/repair":
+                    require_configured(state_ref["paths"], st)
+                    if profile_processes(state_ref["paths"]):
+                        raise ValueError("Stop this profile before repairing configuration")
                     out: dict = {"config": {"rewritten": False}}
                     errs = validate_conf(state_ref["paths"], st)
                     if errs or not state_ref["paths"].engine_conf.is_file():
@@ -1528,6 +1712,9 @@ def main(argv: list[str] | None = None) -> int:
             sp.add_argument("--role", choices=("server", "client"))
             sp.add_argument("--peer", help="peer address (server IP for a client)")
             sp.add_argument("--name", help="computer name for this machine")
+            sp.add_argument("--peer-name", help="client computer name for the server layout")
+            sp.add_argument("--trust-fingerprint", help="complete peer SHA256 fingerprint compared on the other PC; never inferred from the network")
+            sp.add_argument("--quiet-layouts", action="store_true", help="remember suppression of missing-layout popups; does not install or fix layouts")
             sp.add_argument("--side", choices=tuple(SIDES), help="screen edge (server role only)")
             sp.add_argument("--port", type=int)
             sp.add_argument("--engine", choices=("gui", "core"))
@@ -1555,6 +1742,8 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--cidr", help="scan this network instead of local networks")
     sp.add_argument("--port", type=int)
     add("layout", cmd_layout, "show local input layouts (install the same on the other machine)")
+    sp = add("autostart", cmd_autostart, "explicitly opt in or out of desktop-login startup")
+    sp.add_argument("mode", choices=("on", "off", "status"), default="status", nargs="?")
     sp = add("serve", cmd_serve, "local web UI (127.0.0.1, token-protected)")
     sp.add_argument("--port", type=int, help=f"listen port (default {WEB_DEFAULT_PORT})")
     sp = add("uninstall", cmd_uninstall, "stop, remove product state and scoped firewall rule; keep the engine")
@@ -1565,7 +1754,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "trust" and args.trust_cmd in ("add", "remove") and not args.fingerprint:
         p.error("trust add/remove needs a fingerprint")
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+        if args.json:
+            print(json.dumps({"error": str(e)}))
+        else:
+            print(f"{APP}: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

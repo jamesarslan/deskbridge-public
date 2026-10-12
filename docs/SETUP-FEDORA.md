@@ -1,82 +1,53 @@
-# DeskBridge — Fedora setup (CLIENT)
+# Fedora setup
 
-This machine (GNOME on **Wayland**) runs the Deskflow **client**. The Windows PC
-is the server (it holds the keyboard/mouse). v0.2+ uses the single-file `src/deskbridge` CLI.
-
-## One-time install (as your desktop user)
-
-1. Unzip the bundle: `deskbridge-fedora44-<ver>.zip`.
-2. In the unzipped folder:
-   ```bash
-   sudo dnf install -y engine/deskflow-1.27.0-fedora-44-x86_64.rpm
-   chmod +x src/deskbridge
-   ./src/deskbridge setup --yes --role client --peer <windows-ip> --name fedora
-   ```
-   The setup command (non-interactive variant of the wizard) verifies the engine,
-   keeps or generates the local TLS certificate `~/.config/Deskflow/tls/deskflow.pem`,
-   writes the engine config (backing up any existing one to `Deskflow.conf.bak.<ts>`),
-   stores app state in `~/.config/DeskBridge/default/deskbridge.json`, and prints the
-   fingerprint to compare on the Windows machine.
-   An existing engine config (e.g. from a v0.1 install) is **adopted in place**:
-   certificate and trust database are never regenerated.
-   - Engine RPM sha256 is pinned in `SHA256SUMS.engine` / `ci/manifest.json`:
-     `71cdeec92e4351fced4cf907db5e936959a0923b2855284ca52d8cf1088205a9`.
-   - Without `--yes` the same steps run as an interactive wizard (LAN discovery,
-     screen placement, layout check): `./src/deskbridge setup`.
-
-## First start (pairing)
+Fedora 44 x86_64, Python 3, a graphical desktop and its user systemd manager
+are required for the supplied installer. Extract the ZIP, open a terminal
+there, and run:
 
 ```bash
-./src/deskbridge start
+bash Setup.sh
 ```
-The Deskflow app opens (system tray) and its core connects to the Windows server.
-Then, in order:
-1. **GNOME input-permission prompt**: "Deskflow" asks to access your session input
-   (Wayland RemoteDesktop portal). **Approve** — the Wayland equivalent of X11
-   input injection. GNOME remembers the decision.
-2. **TLS fingerprint dialog**: the client verifies the **Windows server's**
-   certificate fingerprint. Compare with `./src/deskbridge fingerprint` (this side)
-   and `.\tools\DeskBridge.ps1 fingerprint` (Windows) → confirm. It is stored in
-   `~/.config/Deskflow/tls/trusted-servers`; later connections pair automatically.
-3. The Windows side confirms Fedora's fingerprint in its own dialog
-   (see SETUP-WINDOWS.md).
 
-Trust database helpers: `./src/deskbridge trust list|add <fp>|remove <fp>`.
+The installer retrieves the official pinned RPM directly from Deskflow,
+verifies size/SHA256, then asks sudo/dnf to install it. Existing matching
+engines are reused. Choose client, enter the server address and match the
+computer name configured at the server (default fedora).
 
-## Verify
+For scripted setup:
 
 ```bash
-./src/deskbridge status       # processes, unit, TCP 24800, engine, cert, autostart
-./src/deskbridge diagnose      # config/TLS/firewall/reachability checks with fixes
-./src/deskbridge serve         # optional local web UI on 127.0.0.1:8472 (token printed)
+python3 src/deskbridge setup --yes --role client --peer 192.168.1.10 --name fedora --autostart off
+python3 src/deskbridge start
 ```
 
-## Daily use
+--yes accepts setup defaults, never a new fingerprint. Compare full
+fingerprints in native Deskflow pairing dialogs on BOTH machines.
+Approve GNOME's input-sharing permission at the physical desktop.
+Mouse, keyboard and clipboard need a physical check afterward.
 
-- Mouse to the **right edge** of the Fedora screen → cursor moves to Windows.
-  Left edge of Windows → back to Fedora. Keyboard/clipboard follow
-  (clipboardSharing on). **Scroll Lock** toggles cursor lock to the local screen.
-- Start: `./src/deskbridge start`. Stop: `./src/deskbridge stop`.
-- `./src/deskbridge autostart enable` — persistent systemd **user** unit
-  (starts with your GNOME session; **off by default**). `autostart status|disable`.
-- `./src/deskbridge repair` — regenerate the engine config from state (cert +
-  trust DB are never touched).
-- Uninstall: `./src/deskbridge uninstall` (keeps TLS certs + config backup;
-  `--remove-engine` also removes the engine RPM).
+Stop before setup/repair. Existing certificate, trust, GNOME restore token,
+keyboard-layout preferences and unrecognized settings are preserved.
+Use start / stop / restart / status / diagnose / repair / fingerprint.
+For JSON put --json before the action. Optional dashboard: serve.
 
-## Profiles
+Explicit login startup:
 
-`default` uses the standard engine paths (`~/.config/Deskflow`). Other profile
-names (`--profile name`) get a fully isolated engine home, their own systemd unit
-and a distinct port — for testing or running both roles on one box.
+```bash
+python3 src/deskbridge autostart on
+python3 src/deskbridge autostart off
+python3 src/deskbridge autostart status
+```
 
-## Wayland notes
+A client needs no inbound firewall rule. The optional Linux server wizard
+adds a peer accept rule; administrators must review broad firewalld policy.
+This is not an assertion that every other rule is restricted.
 
-- Deskflow supports Wayland (since v1.17) via `libei` + `xdg-desktop-portal`;
-  this machine has libei 1.6.0 and xdg-desktop-portal-gnome 50.0 (V2, includes
-  clipboard). See WAYLAND.md for the doc evidence and known cosmetic bug.
-- The product launches the **GUI** binary (`/usr/bin/deskflow`) by default on
-  purpose: the portal input-trust grant belongs to that app origin. `deskflow-core`
-  is available as an opt-in (`engine=core` in state) for X11 boxes.
-- If the mouse works but **clipboard** doesn't, check that the GNOME input
-  permission was granted for "Deskflow" (portal permission UI) and restart the client.
+Profiles use --profile NAME before the command. Non-default profiles isolate
+configuration and keys; choose an explicit matching --port at both ends.
+Deskflow only supports one GUI per user. Core mode is opt-in for isolated
+X11 tests; changing engine origin may require a fresh GNOME grant.
+
+If layouts differ, install matching GNOME input sources. Optional setup
+--quiet-layouts remembers popup suppression without correcting layouts.
+Uninstall removes the product profile/unit, keeps TLS/trust and backups,
+and leaves the shared engine package installed.

@@ -1,80 +1,45 @@
-# DeskBridge — Testing matrix (what is claimed and how)
+# Verification record — v0.2.0-rc2
 
-Honest per-claim verification record. Updated 2026-10-12 for v0.2.0-rc1.
+Independent review, 2026-10-12. This matrix replaces unsupported rc1 claims.
 
-## Physical (reference desk, 2026-10-12)
-
-| Claim | Evidence |
+| Scope | Result and evidence |
 |---|---|
-| Mouse + keyboard cross the Windows-left edge onto the Fedora Wayland client | User confirmed at the desk after approving the GNOME remote-interaction prompt |
-| Text clipboard transfer works both ways | Client log: successful clipboard transfer recorded |
-| TLS 1.3 with mutual SHA-256 fingerprint pinning active | Client log + trust DBs on both sides; local cert `~/.config/Deskflow/tls/deskflow.pem`, fingerprint unchanged across the v0.1→v0.2 cutover |
-| Windows inbound TCP 24800 scoped to the Fedora IP | Windows Firewall rule on Private/Domain profiles (user-applied; `DeskBridge.ps1` manages it) |
-| v0.2 adopts an existing v0.1 install in place | `setup --yes` on the default profile keeps the existing cert, writes a `Deskflow.conf.bak.*` backup, stores state; `status`/`diagnose` green except "server reachable" while the server is stopped |
+| Python logic/files | 17 original app tests and 16 review regressions pass on Fedora. Three template suites also pass. Regressions cover path traversal, managed-key merging, valid legacy arrays, server definitions/vertical edges, trust stores, disabled pin rejection, bounded scans, IP parsing, ownership isolation, core arguments, autostart-off and no silent trust, JSON failure status, repair and uninstall preservation. |
+| Actual TLS and HTTP | Review regressions perform a real local TLS handshake and compare its DER SHA256. HTTP tests verify auth, rejected Origin, cache headers, one HTML response and refusal to start an unconfigured profile. On Windows the TLS test skips when OpenSSL is absent; it passes on Fedora. |
+| Windows native configuration/crypto | PowerShell parsing plus test_windows.ps1 pass on this Windows host: saved preferences/permission keys, computer definitions, vertical edges, unchanged reruns, real .NET RSA/PEM generation, stable identity and private-key ACLs. Temporary test directories are removed. |
+| Real Linux lifecycle | integration-fedora.py passes with the installed Deskflow core, user systemd and a separate Xvfb X11 display: generated server/client settings, mutual pinning, protocol connection, idempotent start, repeated stop/restart, opt-in autostart enable/disable, server SIGKILL recovery, client reconnect, setup/repair preservation and repeated uninstall. Unique test units/profiles are cleaned up. |
+| Actual two-machine connection | The reviewed Windows helper started the existing installed server; the reviewed Linux GUI client detected Wayland, connected to a secure socket and reached ESTABLISHED with the trusted peer. Config validated and autostart remained off. Both apps were stopped afterward to restore their previous state. |
+| Physical input | User previously confirmed mouse/keyboard across the left edge after approving GNOME input sharing, with clipboard and TLS recorded. No new physical mouse, typing or clipboard action was performed during rc2 review. A TCP/TLS connection does not replace that test. |
+| GNOME permission | Existing nonempty compositor restore token was observed in Deskflow.state without exposing it. The default GUI origin and state location are preserved. Login/reboot persistence and renewed physical input were not independently verified. |
+| Keyboard layouts | Added the missing Turkish GNOME input source while preserving existing sources. Deskflow's Xwayland metadata still reported Turkish missing, so its persisted popup-suppression preference was enabled. No claim of complete Turkish/Swedish/English translation coverage. |
+| Packaging | Product-only reproducible ZIPs, required helper/launcher files, per-file SHA256 and source revision are verified. Installer downloads use official pinned size/SHA256. Release assets must be re-downloaded and checksum-verified after publication. |
+| CI | GitHub refused to start the earlier public CI job: its check annotation explicitly says the account is locked due to a billing issue. No steps ran. Local checks are not a passing CI run. |
 
-The live session is **not** re-run during product testing; v0.2 wizard output is
-content-equivalent to the validated v0.1 config (same keys/values, verified by
-`validate_conf` and the byte comparison above).
+## Deliberate limits
 
-## Simulated (this machine, isolated profiles, live session untouched)
+Fresh elevated Windows MSI install/update/uninstall was not run during review
+(the existing engine was already installed). The real Windows checks cover
+helper runtime against that installation and temporary configuration/crypto.
+A clean Windows test machine and interactive UAC are required to expand that
+coverage. Linux login/reboot startup is not tested by toggling unit enablement.
 
-Run with `--profile testN` (isolated engine home, own unit name, own port) and a
-before/after process diff proving the live session was not disturbed:
+There is no secure-desktop, other-OS, all-layout, latency or signed-installer
+claim. The supplied automatic Linux engine installer targets Fedora 44 x86_64.
+The optional Linux server accept rule does not prove a broad firewall policy
+restricts access. Concurrent GUI profiles are unsupported by upstream.
 
-- Install / upgrade / uninstall lifecycle (`setup` → `uninstall`; engine RPM left
-  in place, TLS dir preserved, `.uninstalled_<ts>` config backup left for restore).
-- `start` / `stop` / `restart` repeated; stop order = supervisor unit first, then
-  process kill (so a deliberate stop is not "restarted" by the supervisor).
-- Reconnect/backoff: killing the engine mid-run → systemd-run
-  `Restart=on-failure RestartSec=3` brings it back.
-- Pairing persistence: trust DB survives restart; a second connect does not
-  re-prompt (fingerprints pre-seeded via `trust add`).
-- LAN discovery: loopback engine server on a test port is found by `discover`
-  (passive TCP probe only — no protocol traffic, no pairing prompts on peers).
-- Web UI (`serve`): status GET, start/stop POST with per-launch token; bad token
-  → 401; bound to 127.0.0.1 only.
-- Config validation: missing keys, TLS off, `externalConfigFile` + legacy
-  `internalConfig` conflict, missing screen map — all rejected with actionable
-  messages (tests/test_deskbridge.py).
-- State adoption: an existing engine config with no app state is adopted for
-  `status` / `diagnose` / web UI without writing state (tests/test_deskbridge.py).
-- Wizard idempotence: re-running a completed setup reports no change.
+## Repeat the checks
 
-## Unit
+python3 tests/test_deskbridge.py
+python3 tests/test_regressions.py
+python3 tests/test_client_config.py
+python3 tests/test_server_config.py
+python3 tests/test_server_ini.py
 
-- `tests/test_deskbridge.py` — app core: version parsing, profile path isolation
-  and port allocation, state round-trip, engine config write/validate (client +
-  server), screen map content, state adoption, fingerprint canon/normalization,
-  trust add/list/remove, firewall rich-rule string, SIDES symmetry.
-- `tests/test_server_config.py`, `tests/test_server_ini.py`,
-  `tests/test_client_config.py` — shipped config templates parse and carry the
-  required keys.
-- `tests/run-local-smoke.sh` — real engine: server + client on one box (Xwayland),
-  TLS hello + layout exchange held for 10 s.
+Windows: pwsh -NoProfile -File tests/test_windows.ps1
 
-## CI
+Fedora with Deskflow, OpenSSL, Xvfb and user systemd:
+python3 tests/integration-fedora.py
 
-Workflows present (`ci.yml`: syntax + unit + config tests + manifest digest
-reachability; `release.yml`: bundle build + ZIP-content validation on tag).
-GitHub Actions on this account was **broken account-level** as of 2026-10-12
-(every workflow fails at build with `startup_failure/BuildFailed`, 0 jobs, all
-repos, since ~2026-10-04). Releases were therefore built locally
-with the same `ci/` scripts and published via `gh release`; the rc1 assets were
-re-downloaded through the API and sha256-verified against `SHA256SUMS`.
-
-## Windows side (manual; enumerated remainder)
-
-The v0.1 PowerShell helper was run physically on 2026-10-12 (install, engine MSI,
-firewall scoping, pairing, stop; Desktop shortcuts created). v0.2 does not change
-the Windows engine or its config layout; the helper is unchanged in v0.2.0-rc1.
-Remainder that stays manual: any future Windows-side helper changes must be run
-on the machine; there is no remote (SSH/RDP) access from the Fedora box to the
-Windows PC currently, so this cannot be automated from here.
-
-## Known limitations (labeled)
-
-- Single-operator desk setup (one server, one client). Multi-client layouts: the
-  engine supports them; the wizard is two-machine oriented.
-- Cosmetic (upstream): on a Wayland **server** the cursor may not hide at the
-  screen edge (compositor limitation).
-- No macOS bundle. No cloud, accounts, telemetry, or update checks.
+Virtual-display tests do not use the physical desktop. A real desk check
+requires a human: move left, type, copy/paste both ways, and return right.

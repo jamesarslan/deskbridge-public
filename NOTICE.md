@@ -1,21 +1,20 @@
-# NOTICE
+# Third-party notice
 
-DeskBridge is a thin setup layer (installers, helpers, configs, docs) around the
-unmodified **Deskflow** engine.
+DeskBridge's original product code is MIT licensed; see LICENSE.
+Deskflow is a separate, unmodified upstream application:
+https://github.com/deskflow/deskflow/releases/tag/v1.27.0
 
-## Bundled upstream components (unmodified)
+Deskflow is GPL-2.0-only with the OpenSSL exception and additional component
+licenses. Its license and source are available from the upstream tag:
+https://github.com/deskflow/deskflow/blob/v1.27.0/LICENSE
+https://github.com/deskflow/deskflow/tree/v1.27.0/LICENSES
 
-- **Deskflow v1.27.0** — https://github.com/deskflow/deskflow (release tag `v1.27.0`)
-  - `engine/deskflow-1.27.0-win-x64.msi` (Windows x64 installer)
-  - `engine/deskflow-1.27.0-fedora-44-x86_64.rpm` (Fedora 44 x86_64)
-  - License: GPL-2.0-only, with component licenses in `licenses/` of the upstream repo
-    (GPL-2.0-only, LGPL-2.1-only, MIT, OpenSSL exception). See
-    https://github.com/deskflow/deskflow/blob/master/COPYING and its `LICENSES/` directory.
-  - Engine files are downloaded by the build (CI) from the pinned upstream release
-    URLs and verified against `ci/manifest.json` (sha256 + size). They are never
-    modified by this project.
+DeskBridge v0.2.0-rc2 ZIPs do not redistribute Deskflow or its dependencies.
+Setup downloads the official installer directly from upstream and verifies
+the size/SHA256 in ci/manifest.json. Upstream remains responsible for its own
+release source/dependency distribution. If a future DeskBridge release
+redistributes binaries, corresponding source and all component notices must
+be addressed before publication. Earlier rc1 binary bundles are withdrawn.
 
-## This project's own files
-
-Everything else in this repository (tools/, config/, ci/, tests/, docs/,
-workflows, README, STATUS) is MIT-licensed, see `LICENSE`.
+DeskBridge is independently maintained, with no implied affiliation or
+endorsement by Deskflow, Symless or earlier engine authors.

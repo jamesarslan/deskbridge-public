@@ -10,7 +10,7 @@
 
 ## Rules
 
-- [ ] No engine changes (engine/ stays pinned and unmodified)
+- [ ] No engine changes (official downloads stay pinned and unmodified)
 - [ ] `src/deskbridge` still stdlib-only
-- [ ] `tools/DeskBridge.ps1` still PS 5.1 compatible, no hard-coded addresses
+- [ ] `tools/DeskBridge.ps1` is PowerShell 7.4+ compatible, no hard-coded addresses
 - [ ] No secrets, machine addresses, or personal data in code, docs, or tests

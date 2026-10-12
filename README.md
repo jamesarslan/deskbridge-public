@@ -1,82 +1,61 @@
 # DeskBridge
 
-Deskflow-based KVM bridge for a two-machine desk:
+Free, volunteer-maintained keyboard, mouse and text clipboard sharing for a
+Windows server and Fedora desktop. DeskBridge guides and supervises the
+unmodified [Deskflow](https://deskflow.org) engine. It is a community project,
+not an incorporated charity or an official Symless/Deskflow product.
 
-```
- +--------+  +----------+
- | fedora |  | windows  |   <- move mouse LEFT across the windows left edge
- +--------+  +----------+
- (client)            (server: keyboard + mouse attached here)
-```
+**Prerelease:** use [v0.2.0-rc2](https://github.com/jamesarslan/deskbridge-public/releases/tag/v0.2.0-rc2).
+Earlier rc1 bundles are withdrawn following independent review.
 
-- **Windows = Deskflow server** (holds the physical keyboard/mouse).
-- **Fedora 44 (GNOME Wayland) = Deskflow client**.
-- Shared mouse, keyboard and **text clipboard** across TCP **24800**, **TLS on**
-  (Deskflow default) with first-run **fingerprint pairing**.
-- Login-time autostart is **optional and off by default** on both sides.
-- Guided `setup` wizard (role, LAN discovery, screen placement, pairing),
-  `status` / `diagnose` / `repair`, supervisor restart on crash, and a local
-  web UI on Fedora (`serve`). See `ARCHITECTURE.md`.
-- Engine: **unmodified upstream Deskflow v1.27.0** (pinned sha256 in
-  `ci/manifest.json`). Wrapper layer (this repo) is MIT; engine stays GPL-2.0
-  (see `NOTICE.md`, `licenses/`).
+## Install
 
-## Bundles (GitHub releases)
+Download the ZIP for your platform and extract it into a permanent folder.
+The small ZIP contains DeskBridge source and helpers. First setup downloads
+Deskflow 1.27.0 directly from its official release and checks its pinned
+size and SHA256. Internet access is needed for that first installation.
 
-| File | Contents |
-|---|---|
-| `deskbridge-win64-<ver>.zip` | `engine/deskflow-1.27.0-win-x64.msi`, `tools/DeskBridge.ps1`, `config/server.config`, `docs/SETUP-WINDOWS.md` |
-| `deskbridge-fedora44-<ver>.zip` | `engine/deskflow-1.27.0-fedora-44-x86_64.rpm`, `src/deskbridge`, `config/client.conf`, `docs/SETUP-FEDORA.md` |
+- **Windows 10/11 x64, server:** install PowerShell 7.4+, open **Setup.cmd**,
+  approve Windows UAC, and enter the Fedora PC's IP address. Default computer
+  names are `windows` and `fedora`, with Fedora on the left. Use the created
+  **Start DeskBridge** / **Stop DeskBridge** desktop shortcuts.
+- **Fedora 44 x86_64, client:** open a terminal in the extracted folder and run
+  `bash Setup.sh`. Choose client, enter the Windows server address, and use
+  the same client computer name as the server's layout.
+- Compare the **complete SHA256 fingerprints on both computers** when
+  Deskflow asks to pair. On GNOME approve its input-sharing permission.
+  `--yes` never accepts a new peer automatically.
+- Move the Windows cursor left onto Fedora, type, and test clipboard both
+  ways. A running process or TCP connection alone is not this physical test.
 
-Each zip ships its own `SHA256SUMS.engine`; the release page ships `SHA256SUMS`
-for the zips.
+[Windows setup](docs/SETUP-WINDOWS.md) Â· [Fedora setup](docs/SETUP-FEDORA.md) Â·
+[Verification and limits](docs/TESTING.md) Â· [Security](SECURITY.md).
 
-## Quick start
+## Daily use
 
-Windows (elevated PowerShell, in unzipped folder):
-```powershell
-.\tools\DeskBridge.ps1 install
-.\tools\DeskBridge.ps1 start
-```
-Fedora (as your desktop user, in unzipped folder):
-```bash
-sudo dnf install -y engine/*.rpm
-./src/deskbridge setup --yes --role client --peer <windows-ip> --name fedora
-./src/deskbridge start
-```
-First connection: confirm the TLS fingerprint dialog on **both** machines
-(compare `src/deskbridge fingerprint` with `.\tools\DeskBridge.ps1 fingerprint`);
-on Fedora approve the GNOME input-permission prompt once.
-Details: `docs/SETUP-WINDOWS.md`, `docs/SETUP-FEDORA.md`, `docs/WAYLAND.md`.
+Windows: desktop shortcuts, or `pwsh -File tools/DeskBridge.ps1 start` /
+`stop`. Other actions: `restart`, `status`, `diagnose`, `fingerprint`.
 
-Helpers on both sides: `status`, `stop`, `start`, `restart`, `autostart`,
-`uninstall`; Fedora additionally `setup`, `diagnose`, `repair`, `discover`,
-`fingerprint`, `trust`, `layout`, `serve` (web UI), `version`.
+Fedora: `python3 src/deskbridge start`, `stop`, `restart`, `status`,
+`diagnose`, `fingerprint`. Add `--json` **before** the action for JSON.
+Optional local dashboard: `python3 src/deskbridge serve`; open its printed
+127.0.0.1 URL. The dashboard controls an already configured profile.
 
-## Repo layout
+Autostart is off on a fresh setup. Explicitly opt in using the commands in
+the platform guide. Setup preserves existing autostart choices and pairing.
+Stop the engine before changing settings. Keep the extracted folder because
+shortcuts refer to its helper.
 
-```
-src/      deskbridge (Fedora CLI, single file, Python 3 stdlib only)
-config/   server.config (Deskflow screen map), client.conf (client INI), server.conf (INI template)
-tools/    DeskBridge.ps1 (Windows console wizard)
-ci/       manifest.json (pinned artifacts), download_manifest.py, package_bundles.py
-tests/     config structure tests, app-core regression tests, manifest fetch, loopback engine smoke
-docs/     setup guides, Wayland evidence, testing matrix
-.github/  ci.yml (syntax/tests/manifest checks), release.yml (bundles on tag v*)
-```
+Missing-layout warnings indicate a layout difference. Install matching
+layouts first; optional `--quiet-layouts` (Fedora) or `-QuietLayouts`
+(Windows setup) remembers popup suppression but does not fix translation.
 
-## Build
+## Contribute and license
 
-```bash
-tests/fetch-engine.sh                 # download pinned engine into engine/
-python3 ci/download_manifest.py stage # CI: verify digests
-python3 ci/package_bundles.py stage   # CI: build bundles + SHA256SUMS + RELEASE.md
-tests/test_deskbridge.py              # app-core regression tests (no root/display needed)
-tests/run-local-smoke.sh              # loopback engine test (needs an X display)
-```
+[Contributing](CONTRIBUTING.md) Â· [Roadmap](ROADMAP.md) Â·
+[Code of conduct](CODE_OF_CONDUCT.md) Â· [Architecture](ARCHITECTURE.md).
 
-Tagging `vX.Y.Z` on `main` builds and publishes the release automatically.
-
-## Status & limitations
-
-See `docs/TESTING.md` (verification matrix) and `RELEASE.md` per release.
+DeskBridge's original helpers are MIT licensed. MIT permits commercial reuse
+by others; the project's own distribution is free. Deskflow has its own GPL
+and component licenses. New DeskBridge ZIPs contain no third-party engine
+binaries; see [NOTICE.md](NOTICE.md).

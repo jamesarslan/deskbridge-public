@@ -15,9 +15,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download pinned engine artifacts (sha256 + size verified)
-        run: python3 ci/download_manifest.py stage
-
       - name: Assemble bundles + checksums + release notes
         run: python3 ci/package_bundles.py stage
 
@@ -35,6 +32,6 @@ jobs:
             stage/release/SHA256SUMS
             stage/release/RELEASE.md
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: false
           body_path: stage/release/RELEASE.md

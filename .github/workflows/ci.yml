@@ -45,7 +45,9 @@ jobs:
         run: python3 tests/test_client_config.py
 
       - name: App core tests
-        run: python3 tests/test_deskbridge.py
+        run: |
+          python3 tests/test_deskbridge.py
+          python3 tests/test_regressions.py
 
       - name: Manifest reachable + sizes match
         run: |
@@ -60,3 +62,11 @@ jobs:
                   if clen and clen != a['size']:
                       sys.exit(f"size mismatch for {name}: manifest {a['size']}, live {clen}")
           EOF
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows configuration and certificate regressions
+        shell: pwsh
+        run: ./tests/test_windows.ps1

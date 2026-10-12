@@ -1,43 +1,24 @@
-# Wayland support — evidence (checked 2026-10-12 against official Deskflow sources)
+# GNOME Wayland
 
-## Official statements (desktopFlow/deskflow, tag v1.27.0 era master)
+Deskflow 1.27.0 uses libei and xdg-desktop-portal for GNOME input sharing.
+The human approves remote interaction on the Fedora desktop. Certificate
+pairing and GNOME input permission are separate decisions.
 
-- `README.md`: *"TLS encryption is enabled by default. Wayland is supported.
-  Clipboard sharing is supported."*
-- `README.md` (Wayland section): Wayland support added in **v1.1.17**; on Linux
-  client/server on Wayland it uses the **libei** + **libportal** stack;
-  requirements: libei ≥ 1.3, libportal ≥ 0.8, Qt 6.7+ for the GUI.
-- `wiki/Known-Issues` + discussion **#7499** (Wayland support status matrix):
-  - **Server** role on Wayland needs the portal **InputCapture** extension —
-    GNOME ≥ 46.
-  - **Client** role on Wayland needs the portal **RemoteDesktop** extension.
-  - **GNOME 50+ provides V2** of the remote-desktop/input portal, which adds
-    **clipboard access** for the client.
-  - Known cosmetic bug: on a Wayland *server* the cursor may not hide when it
-    leaves the screen edge (compositor limitation; does not affect switching).
+The default GUI origin matches the previously validated desktop setup.
+DeskBridge preserves client/server xdpRestoreToken keys on configuration
+changes. The compositor can revoke permissions or invalidate a token;
+stored tokens alone do not prove permission is active.
 
-## This machine (Fedora 44 Workstation, GNOME session on Wayland)
+A real physical Windows-server/Fedora-GNOME-client session worked before
+this review after human approval. The independent automated lifecycle tests
+use a separate Xvfb X11 desktop, not GNOME Wayland. They cannot demonstrate
+physical cursor behavior, permission persistence across login, secure
+desktop, or every keyboard layout.
 
-| Requirement        | Needed      | Installed            | OK |
-|--------------------|-------------|----------------------|----|
-| libei              | ≥ 1.3       | 1.6.0                | ✓  |
-| xdg-desktop-portal | present     | 1.22.1               | ✓  |
-| portal (GNOME)      | ≥ 46/50     | 50.0 (V2, clipboard)  | ✓  |
-| Qt 6 (GUI)          | 6.7+        | 6.10.x (Qt6Core 6.10) | ✓  |
-| Engine build        | fedora-44   | upstream v1.27.0 RPM | ✓  |
+Install the same layouts on both computers to avoid missing-layout dialogs.
+The upstream Don't show again choice is preserved. Optional quiet-layouts
+only suppresses that dialog; it does not improve translation.
 
-Conclusion: **client mode works on GNOME Wayland** (RemoteDesktop portal, V2 with
-clipboard). Server mode on this same box would also work (InputCapture portal,
-GNOME 50 ≥ 46) — but the server runs on Windows anyway.
-
-## First-run prompts (client, GNOME)
-
-1. Portal permission: "Allow Deskflow to access your session input" — approve.
-2. TLS fingerprint dialog — confirm the Windows server certificate (see SETUP docs).
-
-## Residual risk
-
-Verified by docs + installed dependency versions; NOT by a live second machine
-(Windows box has no shell access). The loopback engine smoke test
-(`tests/run-local-smoke.sh`) additionally proves the v1.27.0 engine binary itself:
-config parsing, TCP 24800 listen, TLS handshake, client acceptance.
+If input stops: check server listener, full fingerprints, native Deskflow
+logs and the GNOME permission prompt. Stop/start only the affected profile;
+do not reset certificates or revoke unrelated permissions as a first step.
