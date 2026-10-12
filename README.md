@@ -83,9 +83,11 @@ connected model generation to development tools and work on the Linux machine.
 The shared development preset also used OpenRouter Jev for typed decisions;
 the final release received a separate Codex review and fixes.
 
-That workflow produced DeskBridge's setup, configuration, lifecycle and
-packaging helpers around the existing open-source Deskflow engine. Deskflow's
-contributors deserve credit for the underlying input-sharing technology.
+We studied how existing keyboard and mouse sharing solutions work and adapted
+open-source tools to fit a Windows-and-Fedora desk. That workflow produced
+DeskBridge's setup, configuration, lifecycle and packaging helpers around the
+existing Deskflow engine. Deskflow's contributors deserve credit for the
+underlying input-sharing technology.
 
 **Using DeskBridge needs no GPU, LLM or AI account.** AI helped build the
 helpers; normal keyboard and mouse sharing runs through Deskflow.
