@@ -13,7 +13,7 @@ Independent review, 2026-10-12. This matrix replaces unsupported rc1 claims.
 | GNOME permission | Existing nonempty compositor restore token was observed in Deskflow.state without exposing it. The default GUI origin and state location are preserved. Login/reboot persistence and renewed physical input were not independently verified. |
 | Keyboard layouts | Added the missing Turkish GNOME input source while preserving existing sources. Deskflow's Xwayland metadata still reported Turkish missing, so its persisted popup-suppression preference was enabled. No claim of complete Turkish/Swedish/English translation coverage. |
 | Packaging | Product-only reproducible ZIPs, required helper/launcher files, per-file SHA256 and source revision are verified. Installer downloads use official pinned size/SHA256. Release assets must be re-downloaded and checksum-verified after publication. |
-| CI | GitHub refused to start the earlier public CI job: its check annotation explicitly says the account is locked due to a billing issue. No steps ran. Local checks are not a passing CI run. |
+| CI | Automated CI did not run for this release. Local checks are not a passing CI run. |
 
 ## Deliberate limits
 

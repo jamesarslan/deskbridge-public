@@ -50,8 +50,8 @@ size and SHA256. Internet access is needed for that first installation.
 - Move the Windows cursor left onto Fedora, type, and test clipboard both
   ways. A running process or TCP connection alone is not this physical test.
 
-[Windows setup](docs/SETUP-WINDOWS.md) Â· [Fedora setup](docs/SETUP-FEDORA.md) Â·
-[Verification and limits](docs/TESTING.md) Â· [Security](SECURITY.md).
+[Windows setup](docs/SETUP-WINDOWS.md) · [Fedora setup](docs/SETUP-FEDORA.md) ·
+[Verification and limits](docs/TESTING.md) · [Security](SECURITY.md).
 
 ## Daily use
 
@@ -77,7 +77,7 @@ layouts first; optional `--quiet-layouts` (Fedora) or `-QuietLayouts`
 DeskBridge grew from a practical question: could a custom AI coding setup help
 make a Windows-and-Linux desk work smoothly with one keyboard and mouse?
 
-Development used a custom [OMP harness](https://github.com/jamesarslan/omp-harness)
+Development used a custom agent harness (private)
 with a local Qwen 27B model served from an NVIDIA GeForce RTX 5090. The harness
 connected model generation to development tools and work on the Linux machine.
 The shared development preset also used OpenRouter Jev for typed decisions;
@@ -111,13 +111,12 @@ parity, remote video, native file transfer or other operating-system bundles.
 
 Yes, as a prerelease for the documented Windows/Fedora setup. Fresh elevated
 Windows installation and login/reboot behavior still need broader testing.
-GitHub CI could not start because of an account billing lock; local checks
-and their limits are recorded in [TESTING.md](docs/TESTING.md).
+Automated CI is not running for this release; see [TESTING.md](docs/TESTING.md) for local checks and limits.
 
 ## Contribute and license
 
-[Contributing](CONTRIBUTING.md) Â· [Roadmap](ROADMAP.md) Â·
-[Code of conduct](CODE_OF_CONDUCT.md) Â· [Architecture](ARCHITECTURE.md).
+[Contributing](CONTRIBUTING.md) · [Roadmap](ROADMAP.md) ·
+[Code of conduct](CODE_OF_CONDUCT.md) · [Architecture](ARCHITECTURE.md).
 
 DeskBridge's original helpers are MIT licensed. MIT permits commercial reuse
 by others; the project's own distribution is free. Deskflow has its own GPL
